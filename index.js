@@ -194,6 +194,31 @@ async function run() {
       }
     });
 
+    // ─── ৪. রিভিউ ও রেটিং অ্যাড করার API (POST) ───
+    app.post("/prompts/:id/reviews", async (req, res) => {
+      try {
+        const promptId = req.params.id;
+        const { name, email, rating, comment } = req.body;
+
+        const newReview = {
+          name,
+          email,
+          rating: parseInt(rating),
+          comment,
+          date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })
+        };
+
+        await promptsCollection.updateOne(
+          { _id: new ObjectId(promptId) },
+          { $push: { reviews: newReview } } // অবজেক্টের ভেতর reviews অ্যারেতে পুশ হবে
+        );
+
+        res.send({ success: true, message: "Review added", review: newReview });
+      } catch (error) {
+        res.status(500).send({ message: error.message });
+      }
+    });
+
     // don't touch
     await client.db("admin").command({ ping: 1 });
     console.log(`MongoDB connected successfully to database: ${dbName}`);
