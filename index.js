@@ -219,6 +219,28 @@ async function run() {
       }
     });
 
+    // ─── ৫. রিপোর্ট সাবমিট করার API (POST) ───
+    app.post("/prompts/:id/report", async (req, res) => {
+      try {
+        const promptId = req.params.id;
+        const { userEmail, reason, description } = req.body;
+
+        const reportData = {
+          promptId: new ObjectId(promptId),
+          userEmail,
+          reason,
+          description,
+          status: "pending",
+          createdAt: new Date()
+        };
+
+        await reportsCollection.insertOne(reportData);
+        res.send({ success: true, message: "Report submitted successfully" });
+      } catch (error) {
+        res.status(500).send({ message: error.message });
+      }
+    });
+
     // don't touch
     await client.db("admin").command({ ping: 1 });
     console.log(`MongoDB connected successfully to database: ${dbName}`);
