@@ -26,25 +26,59 @@ async function run() {
   try {
     await client.connect();
 
-    const db = client.db(process.env.AUTH_DB_NAME);
+    // ভাই, এখানে একটা সিঙ্গেল ডাটাবেজ ভ্যারিয়েবল ডিক্লেয়ার করলাম
+    // আপনার .env ফাইলের AUTH_DB_NAME ই হবে মেইন ডাটাবেজ
+    const dbName = process.env.AUTH_DB_NAME || "PromptVerse"
+    const db = client.db(dbName);
+    
+    // এখন এই একটা ডাটাবেজের ভেতরেই ২টা কালেকশন (টেবিল) তৈরি হবে
     const usersCollection = db.collection("users");
     const promptsCollection = db.collection("prompts");
 
-
+    // ─── ১. প্রম্পট সেভ করার API ───
     app.post("/prompts", async (req, res) => {
+      try {
         const prompt = req.body;
+        const { authorEmail, authorRole } = prompt;
+
+        if (!authorEmail) {
+          return res.status(400).send({ success: false, message: "User email is required" });
+        }
+
+        if (authorRole === "user") {
+          const count = await promptsCollection.countDocuments({ authorEmail });
+          if (count >= 3) {
+            return res.status(403).send({ 
+              success: false, 
+              message: "Prompt limit reached for free users. Please upgrade to Creator." 
+            });
+          }
+        }
+
         const result = await promptsCollection.insertOne(prompt);
-        res.send(result);
-    })
+        res.send({ success: true, insertedId: result.insertedId });
+      } catch (error) {
+        res.status(500).send({ success: false, message: "Failed to save prompt" });
+      }
+    });
 
+    // ─── ২. প্রম্পট কাউন্ট নেওয়ার API ───
+    app.get("/prompts/count/:email", async (req, res) => {
+      try {
+        const email = req.params.email;
+        const count = await promptsCollection.countDocuments({ authorEmail: email });
+        res.send({ count });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to get prompt count" });
+      }
+    });
 
-    // dont touch
+    // don't touch
     await client.db("admin").command({ ping: 1 });
-    console.log("MongoDB connected successfully");
+    console.log(`MongoDB connected successfully to database: ${dbName}`);
 
-    // Routes here
-  } finally {
-    // keep connection alive
+  } catch (error) {
+    console.error("MongoDB Connection Error:", error);
   }
 }
 
