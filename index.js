@@ -4,7 +4,7 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 const express = require("express");
 const dotenv = require("dotenv");
 const cors = require("cors");
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
 dotenv.config();
 
@@ -72,6 +72,55 @@ async function run() {
         res.status(500).send({ message: "Failed to get prompt count" });
       }
     });
+
+    // ─── ৩. ডাটাবেজ থেকে সব প্রম্পট গেট (GET) করার API ───
+app.get("/prompts", async (req, res) => {
+  try {
+    // ডাটাবেজ থেকে সব প্রম্পট উল্টো ক্রমানুসারে (নতুনগুলো আগে) নিয়ে আসা
+    // আপনি যদি চান শুধু এডমিন অ্যাপ্রুভড প্রম্পট দেখাবেন, তবে এখানে { status: "approved" } দিতে পারেন
+    const prompts = await promptsCollection
+      .find({})
+      .sort({ createdAt: -1 }) 
+      .toArray();
+
+    res.send({
+      success: true,
+      data: prompts,
+    });
+  } catch (error) {
+    console.error("Error fetching prompts:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch prompts",
+    });
+  }
+});
+
+app.get("/prompts/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    
+    // আইডি ভ্যালিড কিনা চেক করা
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ success: false, message: "Invalid Prompt ID" });
+    }
+
+    const query = { _id: new ObjectId(id) };
+    const prompt = await promptsCollection.findOne(query);
+
+    if (!prompt) {
+      return res.status(404).send({ success: false, message: "Prompt not found" });
+    }
+
+    res.send({
+      success: true,
+      data: prompt,
+    });
+  } catch (error) {
+    console.error("Error fetching prompt details:", error);
+    res.status(500).send({ success: false, message: "Internal Server Error" });
+  }
+});
 
     // don't touch
     await client.db("admin").command({ ping: 1 });
