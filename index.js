@@ -180,6 +180,20 @@ async function run() {
       }
     });
 
+    // ─── ৩. কপি কাউন্ট বাড়ানোর API (PATCH) ───
+    app.patch("/prompts/:id/copy", async (req, res) => {
+      try {
+        const id = req.params.id;
+        await promptsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $inc: { copyCount: 1 } } // যদি copyCount ফিল্ড না থাকে, ১ থেকে শুরু করবে
+        );
+        res.send({ success: true, message: "Copy count incremented" });
+      } catch (error) {
+        res.status(500).send({ message: error.message });
+      }
+    });
+
     // don't touch
     await client.db("admin").command({ ping: 1 });
     console.log(`MongoDB connected successfully to database: ${dbName}`);
