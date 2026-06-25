@@ -26,14 +26,14 @@ async function run() {
   try {
     await client.connect();
 
-    // ভাই, এখানে একটা সিঙ্গেল ডাটাবেজ ভ্যারিয়েবল ডিক্লেয়ার করলাম
-    // আপনার .env ফাইলের AUTH_DB_NAME ই হবে মেইন ডাটাবেজ
     const dbName = process.env.AUTH_DB_NAME || "PromptVerse";
     const db = client.db(dbName);
 
-    // এখন এই একটা ডাটাবেজের ভেতরেই ২টা কালেকশন (টেবিল) তৈরি হবে
+    // কালেকশন ডিক্লেয়ারেশন (সবগুলো এক জায়গায় ডিফাইন করা হয়েছে)
     const usersCollection = db.collection("users");
     const promptsCollection = db.collection("prompts");
+    const bookmarksCollection = db.collection("bookmarks");
+    const reportsCollection = db.collection("reports");
 
     // ─── ১. প্রম্পট সেভ করার API ───
     app.post("/prompts", async (req, res) => {
@@ -42,9 +42,7 @@ async function run() {
         const { authorEmail, authorRole } = prompt;
 
         if (!authorEmail) {
-          return res
-            .status(400)
-            .send({ success: false, message: "User email is required" });
+          return res.status(400).send({ success: false, message: "User email is required" });
         }
 
         if (authorRole === "user") {
@@ -52,28 +50,28 @@ async function run() {
           if (count >= 3) {
             return res.status(403).send({
               success: false,
-              message:
-                "Prompt limit reached for free users. Please upgrade to Creator.",
+              message: "Prompt limit reached for free users. Please upgrade to Creator.",
             });
           }
         }
 
-        const result = await promptsCollection.insertOne(prompt);
+        const result = await promptsCollection.insertOne({
+          ...prompt,
+          copyCount: 0,
+          reviews: [],
+          createdAt: new Date()
+        });
         res.send({ success: true, insertedId: result.insertedId });
       } catch (error) {
-        res
-          .status(500)
-          .send({ success: false, message: "Failed to save prompt" });
+        res.status(500).send({ success: false, message: "Failed to save prompt" });
       }
     });
 
-    // ─── ২. প্রম্পট কাউন্ট নেওয়ার API ───
+    // ─── ২. প্রম্পট কাউন্ট নেওয়ার API ───
     app.get("/prompts/count/:email", async (req, res) => {
       try {
         const email = req.params.email;
-        const count = await promptsCollection.countDocuments({
-          authorEmail: email,
-        });
+        const count = await promptsCollection.countDocuments({ authorEmail: email });
         res.send({ count });
       } catch (error) {
         res.status(500).send({ message: "Failed to get prompt count" });
@@ -83,52 +81,43 @@ async function run() {
     // ─── ৩. ডাটাবেজ থেকে সব প্রম্পট গেট (GET) করার API ───
     app.get("/prompts", async (req, res) => {
       try {
-        // ডাটাবেজ থেকে সব প্রম্পট উল্টো ক্রমানুসারে (নতুনগুলো আগে) নিয়ে আসা
-        // আপনি যদি চান শুধু এডমিন অ্যাপ্রুভড প্রম্পট দেখাবেন, তবে এখানে { status: "approved" } দিতে পারেন
         const prompts = await promptsCollection
           .find({})
           .sort({ createdAt: -1 })
           .toArray();
 
-        res.send({
-          success: true,
-          data: prompts,
-        });
+        res.send({ success: true, data: prompts });
       } catch (error) {
         console.error("Error fetching prompts:", error);
-        res.status(500).send({
-          success: false,
-          message: "Failed to fetch prompts",
-        });
+        res.status(500).send({ success: false, message: "Failed to fetch prompts" });
       }
     });
 
-    // Prompt Details
+    // ─── ৪. একক প্রম্পট ডিটেইলস ও প্রিমিয়াম স্ট্যাটাস গেট (GET) ───
     app.get("/prompts/:id", async (req, res) => {
       try {
         const id = req.params.id;
-        const userEmail = req.query.email; // কুয়েরি প্যারাম থেকে ইউজারের ইমেইল
+        const userEmail = req.query.email;
 
         if (!ObjectId.isValid(id)) {
-          return res
-            .status(400)
-            .send({ success: false, message: "Invalid Prompt ID" });
+          return res.status(400).send({ success: false, message: "Invalid Prompt ID" });
         }
 
-        const prompt = await promptsCollection.findOne({
-          _id: new ObjectId(id),
-        });
+        // ফিক্সড: সিনট্যাক্স এরর ঠিক করা হয়েছে [new ObjectId(id)]
+        const prompt = await promptsCollection.findOne({ _id: new ObjectId(id) });
         if (!prompt) {
-          return res
-            .status(404)
-            .send({ success: false, message: "Prompt not found" });
+          return res.status(404).send({ success: false, message: "Prompt not found" });
         }
 
-        // ইউজার প্রিমিয়াম কিনা চেক করা (ডাটাবেজ থেকে)
+        // সেফটি চেক: ডাটাবেজে ফিল্ড না থাকলে ক্র্যাশ এড়ানোর ব্যবস্থা
+        if (!prompt.reviews) prompt.reviews = [];
+        if (!prompt.copyCount) prompt.copyCount = 0;
+
+        // ইউজার প্রিমিয়াম বা অ্যাডমিন কিনা চেক
         let isPremiumUser = false;
         if (userEmail) {
           const user = await usersCollection.findOne({ email: userEmail });
-          if (user && user.status === "Premium") {
+          if (user && (user.status === "Premium" || user.role === "creator" || user.role === "admin")) {
             isPremiumUser = true;
           }
         }
@@ -150,14 +139,12 @@ async function run() {
           isBookmarked: bookmarked,
         });
       } catch (error) {
-        res
-          .status(500)
-          .send({ success: false, message: "Internal Server Error" });
+        console.error("Error in GET /prompts/:id ->", error);
+        res.status(500).send({ success: false, message: "Internal Server Error", error: error.message });
       }
     });
 
-
-    // ─── ২. বুকমার্ক টগল API (POST) ───
+    // ─── ৫. বুকমার্ক টগল API (POST) ───
     app.post("/prompts/:id/bookmark", async (req, res) => {
       try {
         const promptId = req.params.id;
@@ -180,13 +167,13 @@ async function run() {
       }
     });
 
-    // ─── ৩. কপি কাউন্ট বাড়ানোর API (PATCH) ───
+    // ─── ৬. কপি কাউন্ট বাড়ানোর API (PATCH) ───
     app.patch("/prompts/:id/copy", async (req, res) => {
       try {
         const id = req.params.id;
         await promptsCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $inc: { copyCount: 1 } } // যদি copyCount ফিল্ড না থাকে, ১ থেকে শুরু করবে
+          { $inc: { copyCount: 1 } }
         );
         res.send({ success: true, message: "Copy count incremented" });
       } catch (error) {
@@ -194,7 +181,7 @@ async function run() {
       }
     });
 
-    // ─── ৪. রিভিউ ও রেটিং অ্যাড করার API (POST) ───
+    // ─── ৭. রিভিউ ও রেটিং অ্যাড করার API (POST) ───
     app.post("/prompts/:id/reviews", async (req, res) => {
       try {
         const promptId = req.params.id;
@@ -203,14 +190,14 @@ async function run() {
         const newReview = {
           name,
           email,
-          rating: parseInt(rating),
+          rating: parseInt(rating) || 5,
           comment,
-          date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })
+          date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
         };
 
         await promptsCollection.updateOne(
           { _id: new ObjectId(promptId) },
-          { $push: { reviews: newReview } } // অবজেক্টের ভেতর reviews অ্যারেতে পুশ হবে
+          { $push: { reviews: newReview } }
         );
 
         res.send({ success: true, message: "Review added", review: newReview });
@@ -219,7 +206,7 @@ async function run() {
       }
     });
 
-    // ─── ৫. রিপোর্ট সাবমিট করার API (POST) ───
+    // ─── ৮. রিপোর্ট সাবমিট করার API (POST) ───
     app.post("/prompts/:id/report", async (req, res) => {
       try {
         const promptId = req.params.id;
@@ -231,7 +218,7 @@ async function run() {
           reason,
           description,
           status: "pending",
-          createdAt: new Date()
+          createdAt: new Date(),
         };
 
         await reportsCollection.insertOne(reportData);
@@ -241,7 +228,7 @@ async function run() {
       }
     });
 
-    // don't touch
+    // Connection Ping
     await client.db("admin").command({ ping: 1 });
     console.log(`MongoDB connected successfully to database: ${dbName}`);
   } catch (error) {
