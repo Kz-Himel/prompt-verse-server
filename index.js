@@ -458,6 +458,95 @@ app.get("/my-bookmarks", verifyToken, async (req, res) => {
   }
 });
 
+// ─── ১৩. কারেন্ট ইউজারের দেওয়া সব রিভিউ ও রেটিং পাওয়ার API (SECURED - AGGREGATION) ───
+app.get("/my-reviews", verifyToken, async (req, res) => {
+  try {
+    const userEmail = req.user.email; // টোকেন থেকে লগইন করা ইউজারের ইমেইল নেওয়া হচ্ছে
+
+    const myReviews = await promptsCollection.aggregate([
+      // ১. শুধুমাত্র যে প্রম্পটগুলোতে রিভিউ অ্যারে খালি না সেগুলো ফিল্টার করা
+      { $match: { "reviews.email": userEmail } },
+      
+      // ২. রিভিউ অ্যারে ভেঙে সিঙ্গেল অবজেক্টে রূপান্তর করা
+      { $unwind: "$reviews" },
+      
+      // ৩. শুধুমাত্র কারেন্ট ইউজারের করা রিভিউগুলো ম্যাচ করা
+      { $match: { "reviews.email": userEmail } },
+      
+      // ৪. ফ্রন্টএন্ডের মক ডাটা ফরম্যাটের সাথে ফিল্ডগুলো ম্যাচ করে প্রজেক্ট করা
+      {
+        $project: {
+          _id: { $concat: [ { $toString: "$_id" }, "-", "$reviews.date" ] }, // ইউনিক কি জেনারেট
+          promptId: "$_id",
+          promptTitle: "$title",
+          rating: "$reviews.rating",
+          comment: "$reviews.comment",
+          createdAt: "$reviews.date" // রিভিউ দেওয়ার ডেট
+        }
+      }
+    ]).toArray();
+
+    res.json({
+      success: true,
+      data: myReviews
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ─── ১৪. ইউজার ড্যাশবোর্ড ওভারভিউ স্ট্যাটস API (SECURED) ───
+app.get("/user/dashboard-stats", verifyToken, async (req, res) => {
+  try {
+    const userEmail = req.user.email;
+
+    // ১. ইউজারের সাবস্ক্রিপশন বা প্ল্যান স্ট্যাটাস দেখা (users কালেকশন থেকে)
+    const user = await usersCollection.findOne({ email: userEmail });
+    const subscription = user?.status || "Free";
+
+    // ২. টোটাল বুকমার্ক বা সেভ করা প্রম্পটের সংখ্যা বের করা
+    const savedCount = await bookmarksCollection.countDocuments({ userEmail });
+
+    // ৩. ইউজারের দেওয়া টোটাল রিভিউ কাউন্ট বের করা (prompts এর ভেতরের reviews অ্যারে ফিল্টার)
+    const reviewStats = await promptsCollection.aggregate([
+      { $match: { "reviews.email": userEmail } },
+      { $unwind: "$reviews" },
+      { $match: { "reviews.email": userEmail } },
+      { $count: "totalReviews" }
+    ]).toArray();
+
+    const reviewCount = reviewStats[0]?.totalReviews || 0;
+
+    // ৪. রিসেন্ট অ্যাক্টিভিটি জেনারেট করা (ডাটাবেজের রিয়েল ডাটা অনুযায়ী মিক্সড হিস্ট্রি)
+    const recentSaved = await bookmarksCollection.find({ userEmail }).sort({ createdAt: -1 }).limit(2).toArray();
+    
+    const activities = [];
+    recentSaved.forEach((b, index) => {
+      activities.push({
+        id: `b_${index}`,
+        message: "You bookmarked a prompt from the marketplace",
+        time: b.createdAt ? new Date(b.createdAt).toLocaleDateString() : "Recently"
+      });
+    });
+
+    if (activities.length === 0) {
+      activities.push({ id: "def_1", message: "Welcome to PromptVerse! Explore the marketplace to add activity.", time: "Just now" });
+    }
+
+    res.json({
+      success: true,
+      stats: {
+        savedCount,
+        reviewCount,
+        subscription
+      },
+      activities
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
     // ─── GET USER PROMPT COUNT (SECURED) ───
 app.get("/prompts/count/:email", verifyToken, async (req, res) => {
   try {
