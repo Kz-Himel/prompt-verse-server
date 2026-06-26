@@ -5,13 +5,18 @@ const express = require("express");
 const dotenv = require("dotenv");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+// CORS - CORS/504/404 এরর এড়াতে credentials true সহ কনফিগারেশন
+app.use(cors({
+  origin: process.env.CLIENT_URL || true,
+  credentials: true
+}));
 app.use(express.json());
 
 const client = new MongoClient(process.env.MONGODB_URI, {
@@ -22,98 +27,200 @@ const client = new MongoClient(process.env.MONGODB_URI, {
   },
 });
 
+// ================= FIXED JWKS (Better Auth JWKS Endpoint) =================
+const JWKS = createRemoteJWKSet(
+  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+);
+
+// ================= JWT VERIFY MIDDLEWARE =================
+const verifyToken = async (req, res, next) => {
+  const authHeader = req.headers?.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({ message: "Unauthorized: Missing Token" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ message: "Unauthorized: Token Format Invalid" });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    req.user = payload; // Better Auth টোকেন পে-লোড (sub, email, role, status ইত্যাদি থাকবে)
+    next();
+  } catch (err) {
+    console.log("JWT ERROR:", err);
+    return res.status(403).json({ message: "Invalid or expired token" });
+  }
+};
+
+// ================= MAIN FUNCTION =================
 async function run() {
   try {
-    await client.connect();
+    // await client.connect(); // Vercel/Production deployment এর জন্য এটি কমেন্ট রাখাই ভালো
 
     const dbName = process.env.AUTH_DB_NAME || "PromptVerse";
     const db = client.db(dbName);
 
-    // কালেকশন ডিক্লেয়ারেশন (সবগুলো এক জায়গায় ডিফাইন করা হয়েছে)
+    // কালেকশন ডিক্লেয়ারেশন
     const usersCollection = db.collection("users");
     const promptsCollection = db.collection("prompts");
     const bookmarksCollection = db.collection("bookmarks");
     const reportsCollection = db.collection("reports");
+    const paymentsCollection = db.collection("payments");
 
-    // ─── ১. প্রম্পট সেভ করার API ───
-    app.post("/prompts", async (req, res) => {
+    // ─── ১. প্রম্পট সেভ করার API (SECURED) ───
+    app.post("/prompts", verifyToken, async (req, res) => {
       try {
         const prompt = req.body;
-        const { authorEmail, authorRole } = prompt;
+        const userEmail = req.user.email;
+        const userRole = req.user.role || "user"; // Default role if not present
 
-        if (!authorEmail) {
-          return res.status(400).send({ success: false, message: "User email is required" });
-        }
-
-        if (authorRole === "user") {
-          const count = await promptsCollection.countDocuments({ authorEmail });
+        // রিকোয়ারমেন্ট: ফ্রি ইউজাররা (role === 'user') সর্বোচ্চ ৩টি প্রম্পট অ্যাড করতে পারবে
+        if (userRole === "user") {
+          const count = await promptsCollection.countDocuments({ authorEmail: userEmail });
           if (count >= 3) {
-            return res.status(403).send({
+            return res.status(403).json({
               success: false,
-              message: "Prompt limit reached for free users. Please upgrade to Creator.",
+              message: "Prompt limit reached for free users. Please upgrade to Premium or Creator.",
             });
           }
         }
 
-        const result = await promptsCollection.insertOne({
+        const newPrompt = {
           ...prompt,
+          authorEmail: userEmail,
+          authorRole: userRole,
           copyCount: 0,
           reviews: [],
+          status: "pending", // রিকোয়ারমেন্ট: নতুন প্রম্পট ডিফল্টভাবে pending থাকবে
           createdAt: new Date()
-        });
-        res.send({ success: true, insertedId: result.insertedId });
+        };
+
+        const result = await promptsCollection.insertOne(newPrompt);
+        res.json({ success: true, insertedId: result.insertedId });
       } catch (error) {
-        res.status(500).send({ success: false, message: "Failed to save prompt" });
+        res.status(500).json({ error: error.message });
       }
     });
 
-    // ─── ২. প্রম্পট কাউন্ট নেওয়ার API ───
-    app.get("/prompts/count/:email", async (req, res) => {
-      try {
-        const email = req.params.email;
-        const count = await promptsCollection.countDocuments({ authorEmail: email });
-        res.send({ count });
-      } catch (error) {
-        res.status(500).send({ message: "Failed to get prompt count" });
-      }
-    });
-
-    // ─── ৩. ডাটাবেজ থেকে সব প্রম্পট গেট (GET) করার API ───
+    // ─── ২. অল প্রম্পটস মার্কেটপ্লেস API (PUBLIC - SEARCH, FILTER, SORT, PAGINATION) ───
     app.get("/prompts", async (req, res) => {
       try {
+        const { search, category, aiTool, difficulty, sortBy, page = 1, limit = 6 } = req.query;
+
+        // মার্কেটপ্লেসে শুধুমাত্র approved এবং public প্রম্পট দেখাবে
+        let query = { status: "approved", visibility: "public" };
+
+        // ১. সার্চ লজিক (Title, Tags, AI Tool)
+        if (search) {
+          query.$or = [
+            { title: { $regex: search, $options: "i" } },
+            { aiTool: { $regex: search, $options: "i" } },
+            { tags: { $in: [new RegExp(search, "i")] } }
+          ];
+        }
+
+        // ২. ফিল্টার লজিক
+        if (category) query.category = category;
+        if (aiTool) query.aiTool = aiTool;
+        if (difficulty) query.difficulty = difficulty;
+
+        // ৩. সর্ট লজিক
+        let sortOptions = { createdAt: -1 }; // Default: Latest
+        if (sortBy === "mostCopied") sortOptions = { copyCount: -1 };
+        if (sortBy === "mostPopular") sortOptions = { "reviews.rating": -1 }; // রেটিং অনুযায়ী
+
+        // ৪. পেজিনেশন লজিক
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
         const prompts = await promptsCollection
-          .find({})
-          .sort({ createdAt: -1 })
+          .find(query)
+          .sort(sortOptions)
+          .skip(skip)
+          .limit(parseInt(limit))
           .toArray();
 
-        res.send({ success: true, data: prompts });
+        const totalDocuments = await promptsCollection.countDocuments(query);
+
+        res.json({
+          success: true,
+          data: prompts,
+          meta: {
+            total: totalDocuments,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalDocuments / limit)
+          }
+        });
       } catch (error) {
-        console.error("Error fetching prompts:", error);
-        res.status(500).send({ success: false, message: "Failed to fetch prompts" });
+        res.status(500).json({ error: error.message });
       }
     });
 
-    // ─── ৪. একক প্রম্পট ডিটেইলস ও প্রিমিয়াম স্ট্যাটাস গেট (GET) ───
+    // ─── ৩. ক্রিয়েটর ড্যাশবোর্ড অ্যানালিটিক্স (SECURED - MONGODB AGGREGATION) ───
+    app.get("/creator/analytics", verifyToken, async (req, res) => {
+      try {
+        const userEmail = req.user.email;
+
+        // মঙ্গোডিবি অ্যাগ্রিগেশন পাইপলাইন ব্যবহার করে প্রম্পটের টোটাল কাউন্ট এবং টোটাল কপির যোগফল বের করা
+        const statsAggregation = await promptsCollection.aggregate([
+          { $match: { authorEmail: userEmail } },
+          {
+            $group: {
+              _id: null,
+              totalPrompts: { $sum: 1 },
+              totalCopies: { $sum: "$copyCount" }
+            }
+          }
+        ]).toArray();
+
+        // বুকমার্ক কাউন্ট বের করা
+        const totalBookmarks = await bookmarksCollection.countDocuments({ authorEmail: userEmail });
+
+        const stats = statsAggregation[0] ? {
+          totalPrompts: statsAggregation[0].totalPrompts,
+          totalCopies: statsAggregation[0].totalCopies || 0,
+          totalBookmarks: totalBookmarks
+        } : { totalPrompts: 0, totalCopies: 0, totalBookmarks: 0 };
+
+        // Recharts গ্রাফের জন্য ডেটা প্রিপেয়ার করা (গ্রোথ অ্যানালিটিক্স)
+        const chartDataAggregation = await promptsCollection.aggregate([
+          { $match: { authorEmail: userEmail } },
+          {
+            $group: {
+              _id: { $dateToString: { format: "%b", date: "$createdAt" } },
+              copies: { $sum: "$copyCount" }
+            }
+          },
+          { $project: { name: "$_id", copies: 1, _id: 0 } }
+        ]).toArray();
+
+        // চার্টের মাসের সিকোয়েন্স ঠিক রাখার জন্য মান্থলি অর্ডারিং ম্যাপ করা যেতে পারে, অথবা ডিরেক্ট পাঠানো যায়
+        res.json({ success: true, stats, chartData: chartDataAggregation });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // ─── ৪. একক প্রম্পট ডিটেইলস ও প্রিমিয়াম লক হ্যান্ডেল (PUBLIC/OPTIONAL AUTH) ───
     app.get("/prompts/:id", async (req, res) => {
       try {
         const id = req.params.id;
-        const userEmail = req.query.email;
+        const userEmail = req.query.email; // ফ্রন্টএন্ড থেকে কুয়েরি প্যারামিটারে লগইন থাকা ইউজারের ইমেইল আসবে
 
         if (!ObjectId.isValid(id)) {
-          return res.status(400).send({ success: false, message: "Invalid Prompt ID" });
+          return res.status(400).json({ success: false, message: "Invalid Prompt ID" });
         }
 
-        // ফিক্সড: সিনট্যাক্স এরর ঠিক করা হয়েছে [new ObjectId(id)]
         const prompt = await promptsCollection.findOne({ _id: new ObjectId(id) });
         if (!prompt) {
-          return res.status(404).send({ success: false, message: "Prompt not found" });
+          return res.status(404).json({ success: false, message: "Prompt not found" });
         }
 
-        // সেফটি চেক: ডাটাবেজে ফিল্ড না থাকলে ক্র্যাশ এড়ানোর ব্যবস্থা
-        if (!prompt.reviews) prompt.reviews = [];
-        if (!prompt.copyCount) prompt.copyCount = 0;
-
-        // ইউজার প্রিমিয়াম বা অ্যাডমিন কিনা চেক
+        // ইউজার প্রিমিয়াম, ক্রিয়েটর নাকি অ্যাডমিন তা চেক করা হচ্ছে
         let isPremiumUser = false;
         if (userEmail) {
           const user = await usersCollection.findOne({ email: userEmail });
@@ -122,70 +229,73 @@ async function run() {
           }
         }
 
+        // রিকোয়ারমেন্ট: Private (Premium) প্রম্পট হলে কন্টেন্ট লক করে দেওয়া হবে যদি ইউজার প্রিমিয়াম না হয়
+        let responseData = { ...prompt };
+        if (prompt.visibility === "private" && !isPremiumUser) {
+          responseData.promptContent = "LOCKED_PREMIUM"; // ফ্রন্টএন্ডে এটি দেখে ব্লার/লক মেসেজ দেখাবেন
+        }
+
         // বুকমার্ক স্ট্যাটাস চেক
         let bookmarked = false;
         if (userEmail) {
-          const bookmarkExists = await bookmarksCollection.findOne({
-            userEmail,
-            promptId: id,
-          });
+          const bookmarkExists = await bookmarksCollection.findOne({ userEmail, promptId: id });
           if (bookmarkExists) bookmarked = true;
         }
 
-        res.send({
+        res.json({
           success: true,
-          data: prompt,
+          data: responseData,
           isPremiumUser,
           isBookmarked: bookmarked,
         });
       } catch (error) {
-        console.error("Error in GET /prompts/:id ->", error);
-        res.status(500).send({ success: false, message: "Internal Server Error", error: error.message });
+        res.status(500).json({ error: error.message });
       }
     });
 
-    // ─── ৫. বুকমার্ক টগল API (POST) ───
-    app.post("/prompts/:id/bookmark", async (req, res) => {
+    // ─── ৫. বুকমার্ক টগল API (SECURED) ───
+    app.post("/prompts/:id/bookmark", verifyToken, async (req, res) => {
       try {
         const promptId = req.params.id;
-        const { email } = req.body;
+        const userEmail = req.user.email;
 
-        if (!email) return res.status(400).send({ message: "User email required" });
-
-        const query = { userEmail: email, promptId: promptId };
+        const query = { userEmail, promptId };
         const existingBookmark = await bookmarksCollection.findOne(query);
 
         if (existingBookmark) {
           await bookmarksCollection.deleteOne(query);
-          return res.send({ success: true, bookmarked: false, message: "Bookmark removed" });
+          return res.json({ success: true, bookmarked: false, message: "Bookmark removed" });
         } else {
           await bookmarksCollection.insertOne({ ...query, createdAt: new Date() });
-          return res.send({ success: true, bookmarked: true, message: "Prompt bookmarked" });
+          return res.json({ success: true, bookmarked: true, message: "Prompt bookmarked" });
         }
       } catch (error) {
-        res.status(500).send({ message: error.message });
+        res.status(500).json({ error: error.message });
       }
     });
 
-    // ─── ৬. কপি কাউন্ট বাড়ানোর API (PATCH) ───
+    // ─── ৬. কপি কাউন্ট বাড়ানোর API (PUBLIC/PATCH) ───
     app.patch("/prompts/:id/copy", async (req, res) => {
       try {
         const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid ID" });
+
         await promptsCollection.updateOne(
           { _id: new ObjectId(id) },
           { $inc: { copyCount: 1 } }
         );
-        res.send({ success: true, message: "Copy count incremented" });
+        res.json({ success: true, message: "Copy count incremented" });
       } catch (error) {
-        res.status(500).send({ message: error.message });
+        res.status(500).json({ error: error.message });
       }
     });
 
-    // ─── ৭. রিভিউ ও রেটিং অ্যাড করার API (POST) ───
-    app.post("/prompts/:id/reviews", async (req, res) => {
+    // ─── ৭. রিভিউ ও রেটিং অ্যাড করার API (SECURED) ───
+    app.post("/prompts/:id/reviews", verifyToken, async (req, res) => {
       try {
         const promptId = req.params.id;
-        const { name, email, rating, comment } = req.body;
+        const { name, email } = req.user;
+        const { rating, comment } = req.body;
 
         const newReview = {
           name,
@@ -200,17 +310,18 @@ async function run() {
           { $push: { reviews: newReview } }
         );
 
-        res.send({ success: true, message: "Review added", review: newReview });
+        res.json({ success: true, message: "Review added", review: newReview });
       } catch (error) {
-        res.status(500).send({ message: error.message });
+        res.status(500).json({ error: error.message });
       }
     });
 
-    // ─── ৮. রিপোর্ট সাবমিট করার API (POST) ───
-    app.post("/prompts/:id/report", async (req, res) => {
+    // ─── ৮. রিপোর্ট সাবমিট করার API (SECURED) ───
+    app.post("/prompts/:id/report", verifyToken, async (req, res) => {
       try {
         const promptId = req.params.id;
-        const { userEmail, reason, description } = req.body;
+        const userEmail = req.user.email;
+        const { reason, description } = req.body;
 
         const reportData = {
           promptId: new ObjectId(promptId),
@@ -222,26 +333,176 @@ async function run() {
         };
 
         await reportsCollection.insertOne(reportData);
-        res.send({ success: true, message: "Report submitted successfully" });
+        res.json({ success: true, message: "Report submitted successfully" });
       } catch (error) {
-        res.status(500).send({ message: error.message });
+        res.status(500).json({ error: error.message });
       }
     });
 
-    // Connection Ping
-    await client.db("admin").command({ ping: 1 });
-    console.log(`MongoDB connected successfully to database: ${dbName}`);
+    // ─── ৯. পেমেন্ট সাকসেস হ্যান্ডেলার (SECURED) ───
+    app.post("/payments/success", verifyToken, async (req, res) => {
+      try {
+        const userEmail = req.user.email;
+        const { transactionId, amount } = req.body;
+
+        await paymentsCollection.insertOne({
+          transactionId,
+          email: userEmail,
+          amount,
+          date: new Date()
+        });
+
+        // ইউজার কালেকশনে স্ট্যাটাস Premium করে দেওয়া
+        await db.collection("users").updateOne(
+          { email: userEmail },
+          { $set: { status: "Premium" } }
+        );
+
+        res.json({ success: true, message: "Subscription upgraded to Premium!" });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // ─── ১০. কারেন্ট ইউজারের নিজস্ব প্রম্পট লিস্ট পাওয়ার API (SECURED) ───
+app.get("/my-prompts", verifyToken, async (req, res) => {
+  try {
+    const userEmail = req.user.email; // টোকেন থেকে ইউজারের ইমেইল নেওয়া হচ্ছে
+
+    // শুধুমাত্র এই ইউজারের প্রম্পটগুলোই ডেটাবেজ থেকে খোঁজা হবে
+    const userPrompts = await promptsCollection
+      .find({ authorEmail: userEmail })
+      .sort({ createdAt: -1 }) // লেটেস্টগুলো আগে দেখাবে
+      .toArray();
+
+    res.json({
+      success: true,
+      data: userPrompts,
+    });
   } catch (error) {
-    console.error("MongoDB Connection Error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ─── ১১. প্রম্পট ডিলিট করার API (SECURED) ───
+app.delete("/prompts/:id", verifyToken, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const userEmail = req.user.email;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid ID" });
+    }
+
+    // সিকিউরিটি চেক: ইউজার নিজের প্রম্পট ছাড়া অন্যের প্রম্পট ডিলিট করতে পারবে না
+    const result = await promptsCollection.deleteOne({
+      _id: new ObjectId(id),
+      authorEmail: userEmail
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Prompt not found or unauthorized" });
+    }
+
+    res.json({ success: true, message: "Prompt deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ─── ১২. কারেন্ট ইউজারের বুকমার্ক করা প্রম্পট লিস্ট পাওয়ার API (SECURED - AGGREGATION) ───
+app.get("/my-bookmarks", verifyToken, async (req, res) => {
+  try {
+    const userEmail = req.user.email;
+
+    // Aggregation Pipeline ব্যবহার করে bookmarks এর সাথে prompts কালেকশন জয়েন করা হচ্ছে
+    const bookmarkedPrompts = await bookmarksCollection.aggregate([
+      { 
+        $match: { userEmail: userEmail } 
+      },
+      {
+        $addFields: {
+          promptObjectId: { $toObjectId: "$promptId" } // string promptId কে ObjectId তে কনভার্ট
+        }
+      },
+      {
+        $lookup: {
+          from: "prompts",             // যে কালেকশনের সাথে জয়েন হবে
+          localField: "promptObjectId", // bookmarks কালেকশনের ফিল্ড
+          foreignField: "_id",          // prompts কালেকশনের ফিল্ড
+          as: "promptDetails"           // আউটপুট ফিল্ডের নাম
+        }
+      },
+      {
+        $unwind: "$promptDetails" // অ্যারে থেকে অবজেক্টে নিয়ে আসা
+      },
+      {
+        $project: {
+          _id: "$promptDetails._id", // প্রম্পটের অরিজিনাল আইডি পাস করা যাতে ফ্রন্টএন্ডে সুবিধা হয়
+          bookmarkId: "$_id",        // বুকমার্কের নিজস্ব আইডি
+          title: "$promptDetails.title",
+          category: "$promptDetails.category",
+          aiTool: "$promptDetails.aiTool",
+          copyCount: "$promptDetails.copyCount",
+          authorEmail: "$promptDetails.authorEmail" // ক্রিয়েটরের ইমেইল বা নাম ট্র্যাকের জন্য
+        }
+      }
+    ]).toArray();
+
+    res.json({
+      success: true,
+      data: bookmarkedPrompts
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+    // ─── GET USER PROMPT COUNT (SECURED) ───
+app.get("/prompts/count/:email", verifyToken, async (req, res) => {
+  try {
+    const email = req.params.email;
+
+    // অন্য কারো count দেখতে পারবে না
+    if (req.user.email !== email) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden",
+      });
+    }
+
+    const count = await promptsCollection.countDocuments({
+      authorEmail: email,
+    });
+
+    res.json({
+      success: true,
+      count,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+
+
+// DONT TOUCH
+
+    console.log("MongoDB connected successfully via JWKS architecture");
+  } finally {
+    // Keep alive
   }
 }
 
 run().catch(console.dir);
 
 app.get("/", (req, res) => {
-  res.send("Server is running");
+  res.send("Marketplace API Server Running smoothly!");
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log("Server running on port", PORT);
 });
