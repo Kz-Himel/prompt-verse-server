@@ -56,6 +56,7 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
+
 // ================= MAIN FUNCTION =================
 async function run() {
   try {
@@ -64,12 +65,20 @@ async function run() {
     const dbName = process.env.AUTH_DB_NAME || "PromptVerse";
     const db = client.db(dbName);
 
+console.log("DB Name:", db.databaseName);
+
+console.log(
+  "Collections:",
+  await db.listCollections().toArray()
+);
+
     // কালেকশন ডিক্লেয়ারেশন
-    const usersCollection = db.collection("users");
+    const usersCollection = db.collection("user");
     const promptsCollection = db.collection("prompts");
     const bookmarksCollection = db.collection("bookmarks");
     const reportsCollection = db.collection("reports");
     const paymentsCollection = db.collection("payments");
+
 
     // ─── ১. প্রম্পট সেভ করার API (SECURED) ───
     app.post("/prompts", verifyToken, async (req, res) => {
@@ -573,6 +582,179 @@ app.get("/prompts/count/:email", verifyToken, async (req, res) => {
       success: false,
       message: error.message,
     });
+  }
+});
+
+
+
+// =============ADMIN==============
+    // আপনার JWT ভেরিফাই করার পর এই মিডলওয়্যারটি চলবে
+const verifyAdmin = async (req, res, next) => {
+  try {
+    const email = req.user?.email;
+
+    const user = await usersCollection.findOne({ email }); // ✅ usersCollection
+
+    console.log("DB User:", user);
+
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({
+        message: "Forbidden Access! Admin only.",
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error("Verify Admin Error:", error);
+    res.status(500).json({
+      message: "Internal Server Error",
+    });
+  }
+};
+
+// ১. অ্যানালিটিক্স API (SECURED - Total Users, Prompts, Reviews, Copies)
+app.get('/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const totalUsers = await usersCollection.countDocuments();
+    const totalPrompts = await promptsCollection.countDocuments();
+    
+    // মঙ্গোডিবি অ্যাগ্রিগেশন পাইপলাইন দিয়ে সব প্রম্পটের টোটাল কপির যোগফল বের করা
+    const copyStats = await promptsCollection.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalCopies: { $sum: "$copyCount" }
+        }
+      }
+    ]).toArray();
+    const totalCopies = copyStats[0]?.totalCopies || 0;
+
+    // মঙ্গোডিবি অ্যাগ্রিগেশন পাইপলাইন দিয়ে সব প্রম্পটের মোট রিভিউ সংখ্যা বের করা
+    const reviewStats = await promptsCollection.aggregate([
+      { $unwind: "$reviews" },
+      { $count: "totalReviews" }
+    ]).toArray();
+    const totalReviews = reviewStats[0]?.totalReviews || 0;
+
+    res.json({
+      success: true,
+      stats: { totalUsers, totalPrompts, totalReviews, totalCopies }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ২. সব ইউজারদের ডাটা নিয়ে আসার API (SECURED)
+app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const result = await usersCollection.find().toArray();
+    res.json(result); // ফ্রন্টএন্ড সরাসরি অ্যারে আশা করছে
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ৩. ইউজারের রোল পরিবর্তন করার API (SECURED)
+app.patch('/users/role/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { role } = req.body;
+    
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid User ID" });
+    }
+
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = { $set: { role: role } };
+    
+    const result = await usersCollection.updateOne(filter, updateDoc);
+    res.json({ success: true, message: "User role updated successfully", result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ৪. সব প্রম্পট দেখার API (SECURED)
+app.get('/admin/prompts', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const result = await promptsCollection.find().sort({ createdAt: -1 }).toArray();
+    res.json(result); // ফ্রন্টএন্ড সরাসরি অ্যারে আশা করছে
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ৫. প্রম্পট Approve বা Reject করার API (SECURED)
+app.patch('/prompts/status/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { status, feedback } = req.body; // status: 'approved' বা 'rejected'
+    
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid Prompt ID" });
+    }
+
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = {
+      $set: { 
+        status: status, 
+        feedback: feedback || "" 
+      }
+    };
+    
+    const result = await promptsCollection.updateOne(filter, updateDoc);
+    res.json({ success: true, message: `Prompt status updated to ${status}`, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ৬. সব পেমেন্ট ডাটা tabular ফর্মে দেখানোর API (SECURED)
+app.get('/admin/payments', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const result = await paymentsCollection.find().sort({ date: -1 }).toArray();
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ৭. সব রিপোর্টেড প্রম্পট দেখার API (SECURED)
+app.get('/admin/reported-prompts', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    // Aggregation ব্যবহার করে reports কালেকশনের সাথে prompts কালেকশন জয়েন করা
+    const reportedPrompts = await reportsCollection.aggregate([
+      {
+        $addFields: { promptObjectId: { $toObjectId: "$promptId" } }
+      },
+      {
+        $lookup: {
+          from: "prompts",
+          localField: "promptObjectId",
+          foreignField: "_id",
+          as: "promptDetails"
+        }
+      },
+      { $unwind: "$promptDetails" },
+      {
+        $project: {
+          _id: 1,
+          promptId: "$promptDetails._id",
+          promptTitle: "$promptDetails.title",
+          creatorEmail: "$promptDetails.authorEmail",
+          reporterEmail: "$userEmail",
+          reason: 1,
+          description: 1,
+          status: 1,
+          createdAt: 1
+        }
+      }
+    ]).toArray();
+
+    res.json({ success: true, data: reportedPrompts });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
