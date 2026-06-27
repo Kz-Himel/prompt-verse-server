@@ -763,11 +763,16 @@ async function run() {
       .find()
       .sort({ createdAt: -1 })
       .toArray();
+
+    // সেফটি ম্যাপ: প্রম্পট অবজেক্টে যে নামেই আইডি থাকুক, আমরা ফ্রন্টএন্ডের জন্য একটা ফিক্সড 'creatorId' বানিয়ে দিচ্ছি
+    const formattedPrompts = result.map(prompt => ({
+      ...prompt,
+      creatorId: prompt.userId || prompt.authorId || prompt.user || prompt._userId || null
+    }));
     
-    // ফ্রন্টএন্ডের রিকোয়ারমেন্ট অনুযায়ী রেসপন্স পাঠানো হচ্ছে
     res.json({ 
       success: true, 
-      prompts: result 
+      prompts: formattedPrompts 
     }); 
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -818,7 +823,7 @@ app.put("/admin/prompts/:id/approve", verifyToken, verifyAdmin, async (req, res)
       return res.status(400).json({ success: false, message: "Invalid Prompt ID" });
     }
     const filter = { _id: new ObjectId(id) };
-    const updateDoc = { $set: { status: "Approved" } };
+    const updateDoc = { $set: { status: "approved" } };
     const result = await promptsCollection.updateOne(filter, updateDoc);
     res.json({ success: true, message: "Prompt approved successfully", result });
   } catch (error) {
@@ -844,23 +849,30 @@ app.put("/admin/prompts/:id/reject", verifyToken, verifyAdmin, async (req, res) 
 });
 
 // নতুন ৩. অ্যাডমিন ইউজার ডিলিট API (নতুন ফ্রন্টএন্ড রাউটিং অনুসারে)
-app.delete('/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
+app.delete("/admin/users/:identifier", verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const id = req.params.id;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid User ID" });
+    const { identifier } = req.params;
+    let query = {};
+
+    // চেক করা হচ্ছে প্যারামসটি ইমেইল নাকি মঙ্গোডিবি আইডি
+    if (identifier.includes("@")) {
+      query = { email: identifier };
+    } else {
+      // যদি আইডি হয় তবে ObjectId দিয়ে কোয়েরি হবে
+      const { ObjectId } = require("mongodb");
+      query = { _id: new ObjectId(identifier) };
     }
-    if (req.user?.sub === id || req.user?.id === id) {
-      return res.status(400).json({ success: false, message: "You cannot delete your own admin account!" });
-    }
-    const filter = { _id: new ObjectId(id) };
-    const result = await usersCollection.deleteOne(filter);
+
+    const result = await usersCollection.deleteOne(query);
+
     if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, message: "User not found" });
+      return res.status(404).json({ success: false, message: "User not found!" });
     }
-    res.json({ success: true, message: "User deleted successfully" });
+
+    res.json({ success: true, message: "User deleted successfully!" });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error("Delete user error:", error);
+    res.status(500).json({ success: false, message: "Invalid user id or email format" });
   }
 });
 
