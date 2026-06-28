@@ -250,18 +250,18 @@ async function run() {
             {
               $project: {
                 _id: 1,
-                title: 1,       // Prompt er Title
-                category: 1,    // Prompt er Category
-                aiTool: 1,      // Prompt er AI Tool (যেমন: ChatGPT, Midjourney)
+                title: 1, // Prompt er Title
+                category: 1, // Prompt er Category
+                aiTool: 1, // Prompt er AI Tool (যেমন: ChatGPT, Midjourney)
                 // dynamic bhabe prompt er reviews array theke shudhu amr review-ta filter kore ana
                 myReviewDetails: {
                   $filter: {
                     input: "$reviews",
                     as: "review",
-                    cond: { $eq: ["$$review.email", userEmail] }
-                  }
-                }
-              }
+                    cond: { $eq: ["$$review.email", userEmail] },
+                  },
+                },
+              },
             },
             { $unwind: "$myReviewDetails" },
             {
@@ -272,9 +272,9 @@ async function run() {
                 aiTool: 1,
                 rating: "$myReviewDetails.rating",
                 comment: "$myReviewDetails.comment",
-                date: "$myReviewDetails.date"
-              }
-            }
+                date: "$myReviewDetails.date",
+              },
+            },
           ])
           .toArray();
 
@@ -568,12 +568,10 @@ async function run() {
         });
 
         if (result.deletedCount === 0) {
-          return res
-            .status(404)
-            .json({
-              success: false,
-              message: "Prompt not found or unauthorized",
-            });
+          return res.status(404).json({
+            success: false,
+            message: "Prompt not found or unauthorized",
+          });
         }
 
         res.json({ success: true, message: "Prompt deleted successfully" });
@@ -713,7 +711,8 @@ async function run() {
       }
     });
 
-    app.put("/admin/prompts/:id/approve",
+    app.put(
+      "/admin/prompts/:id/approve",
       verifyToken,
       verifyAdmin,
       async (req, res) => {
@@ -738,7 +737,8 @@ async function run() {
       },
     );
 
-    app.put("/admin/prompts/:id/reject",
+    app.put(
+      "/admin/prompts/:id/reject",
       verifyToken,
       verifyAdmin,
       async (req, res) => {
@@ -764,7 +764,8 @@ async function run() {
       },
     );
 
-    app.get("/admin/reported-prompts",
+    app.get(
+      "/admin/reported-prompts",
       verifyToken,
       verifyAdmin,
       async (req, res) => {
@@ -803,7 +804,8 @@ async function run() {
       },
     );
 
-    app.delete("/admin/users/:identifier",
+    app.delete(
+      "/admin/users/:identifier",
       verifyToken,
       verifyAdmin,
       async (req, res) => {
@@ -814,12 +816,10 @@ async function run() {
             : { _id: new ObjectId(identifier) };
 
           if (req.user.sub === identifier || req.user.email === identifier) {
-            return res
-              .status(400)
-              .json({
-                success: false,
-                message: "You cannot delete your own admin account!",
-              });
+            return res.status(400).json({
+              success: false,
+              message: "You cannot delete your own admin account!",
+            });
           }
 
           const result = await usersCollection.deleteOne(query);
@@ -836,89 +836,162 @@ async function run() {
     );
 
     // For reported prmpt page
-    // 1. REMOVE PROMPT 
-    app.delete("/admin/reported-prompts/:reportId/remove-prompt", verifyToken, verifyAdmin, async (req, res) => {
+    // 1. REMOVE PROMPT
+    app.delete(
+      "/admin/reported-prompts/:reportId/remove-prompt",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { reportId } = req.params;
+
+          if (!ObjectId.isValid(reportId)) {
+            return res
+              .status(400)
+              .json({ success: false, message: "Invalid Report ID" });
+          }
+
+          // ১. প্রথমে রিপোর্ট টা খুঁজে বের করি যেন প্রম্পট আইডি পাই
+          const report = await reportsCollection.findOne({
+            _id: new ObjectId(reportId),
+          });
+          if (!report) {
+            return res
+              .status(404)
+              .json({ success: false, message: "Report not found" });
+          }
+
+          // ২. মূল promptsCollection থেকে প্রম্পটটি ডিলিট করি
+          await promptsCollection.deleteOne({
+            _id: new ObjectId(report.promptId),
+          });
+
+          // ৩. এই রিপোর্টের স্ট্যাটাস 'resolved' করে দিই যেন পেন্ডিং লিস্টে না দেখায়
+          await reportsCollection.updateOne(
+            { _id: new ObjectId(reportId) },
+            { $set: { status: "resolved", actionTaken: "removed_prompt" } },
+          );
+
+          res.json({
+            success: true,
+            message: "Prompt removed and report resolved successfully!",
+          });
+        } catch (error) {
+          res.status(500).json({ success: false, error: error.message });
+        }
+      },
+    );
+
+    // 2. WARN CREATOR
+    app.patch(
+      "/admin/reported-prompts/:reportId/warn-creator",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { reportId } = req.params;
+          const { creatorEmail } = req.body; // ফ্রন্টএন্ড থেকে ক্রিয়েটরের ইমেইল পাঠানো হবে
+
+          if (!ObjectId.isValid(reportId)) {
+            return res
+              .status(400)
+              .json({ success: false, message: "Invalid Report ID" });
+          }
+
+          if (!creatorEmail) {
+            return res
+              .status(400)
+              .json({
+                success: false,
+                message: "Creator email is required to warn",
+              });
+          }
+
+          // ১. ইউজার কালেকশনে ওই ক্রিয়েটরের warningsCount ১ বাড়িয়ে দিই
+          await usersCollection.updateOne(
+            { email: creatorEmail },
+            { $inc: { warningsCount: 1 } }, // যদি ফিল্ড না থাকে, প্রথমবারে ১ হিসেবে তৈরি হবে
+          );
+
+          // ২. রিপোর্টের স্ট্যাটাস আপডেট করি
+          await reportsCollection.updateOne(
+            { _id: new ObjectId(reportId) },
+            { $set: { status: "resolved", actionTaken: "warned_creator" } },
+          );
+
+          res.json({
+            success: true,
+            message: "Creator has been warned and report resolved.",
+          });
+        } catch (error) {
+          res.status(500).json({ success: false, error: error.message });
+        }
+      },
+    );
+
+    // 3. DISMISS / NOT HARMFUL
+    app.patch(
+      "/admin/reported-prompts/:reportId/dismiss",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { reportId } = req.params;
+
+          if (!ObjectId.isValid(reportId)) {
+            return res
+              .status(400)
+              .json({ success: false, message: "Invalid Report ID" });
+          }
+
+          // রিপোর্ট ডিলিট না করে স্ট্যাটাস 'dismissed' করে দেওয়া সবচেয়ে সেফ মেথড
+          await reportsCollection.updateOne(
+            { _id: new ObjectId(reportId) },
+            { $set: { status: "dismissed" } },
+          );
+
+          res.json({
+            success: true,
+            message: "Report dismissed. Prompt is safe.",
+          });
+        } catch (error) {
+          res.status(500).json({ success: false, error: error.message });
+        }
+      },
+    );
+
+    // Profile page dynamic API ───
+    app.get("/user/profile", verifyToken, async (req, res) => {
       try {
-        const { reportId } = req.params;
+        const userEmail = req.user?.email;
 
-        if (!ObjectId.isValid(reportId)) {
-          return res.status(400).json({ success: false, message: "Invalid Report ID" });
-        }
+        // ১. ইউজার কালেকশন থেকে ডাটাবেজ ইনফো আনা
+        const userInfo = await usersCollection.findOne({ email: userEmail });
 
-        // ১. প্রথমে রিপোর্ট টা খুঁজে বের করি যেন প্রম্পট আইডি পাই
-        const report = await reportsCollection.findOne({ _id: new ObjectId(reportId) });
-        if (!report) {
-          return res.status(404).json({ success: false, message: "Report not found" });
-        }
+        // ২. ইউজার নিজে কয়টি প্রম্পট তৈরি করেছে তার কাউন্ট
+        const promptCount = await promptsCollection.countDocuments({
+          authorEmail: userEmail,
+        });
 
-        // ২. মূল promptsCollection থেকে প্রম্পটটি ডিলিট করি
-        await promptsCollection.deleteOne({ _id: new ObjectId(report.promptId) });
-
-        // ৩. এই রিপোর্টের স্ট্যাটাস 'resolved' করে দিই যেন পেন্ডিং লিস্টে না দেখায়
-        await reportsCollection.updateOne(
-          { _id: new ObjectId(reportId) },
-          { $set: { status: "resolved", actionTaken: "removed_prompt" } }
-        );
-
-        res.json({ success: true, message: "Prompt removed and report resolved successfully!" });
+        // রেসপন্স অবজেক্ট যা ফ্রন্টএন্ডের প্রোফাইল কার্ড সরাসরি রিড করতে পারবে
+        return res.status(200).json({
+          success: true,
+          data: {
+            name: userInfo?.name || req.user?.name || "Unknown User",
+            email: userEmail,
+            photoURL:
+              userInfo?.image ||
+              userInfo?.photoURL ||
+              "https://placehold.co/200",
+            role: userInfo?.role || req.user?.role || "User",
+            totalPrompts: promptCount || 0,
+            subscription: userInfo?.subscription || userInfo?.status || "Free", // Premium/Free status
+          },
+        });
       } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, message: error.message });
       }
     });
-
-    // 2. WARN CREATOR 
-    app.patch("/admin/reported-prompts/:reportId/warn-creator", verifyToken, verifyAdmin, async (req, res) => {
-      try {
-        const { reportId } = req.params;
-        const { creatorEmail } = req.body; // ফ্রন্টএন্ড থেকে ক্রিয়েটরের ইমেইল পাঠানো হবে
-
-        if (!ObjectId.isValid(reportId)) {
-          return res.status(400).json({ success: false, message: "Invalid Report ID" });
-        }
-
-        if (!creatorEmail) {
-          return res.status(400).json({ success: false, message: "Creator email is required to warn" });
-        }
-
-        // ১. ইউজার কালেকশনে ওই ক্রিয়েটরের warningsCount ১ বাড়িয়ে দিই
-        await usersCollection.updateOne(
-          { email: creatorEmail },
-          { $inc: { warningsCount: 1 } } // যদি ফিল্ড না থাকে, প্রথমবারে ১ হিসেবে তৈরি হবে
-        );
-
-        // ২. রিপোর্টের স্ট্যাটাস আপডেট করি
-        await reportsCollection.updateOne(
-          { _id: new ObjectId(reportId) },
-          { $set: { status: "resolved", actionTaken: "warned_creator" } }
-        );
-
-        res.json({ success: true, message: "Creator has been warned and report resolved." });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    // 3. DISMISS / NOT HARMFUL 
-    app.patch("/admin/reported-prompts/:reportId/dismiss", verifyToken, verifyAdmin, async (req, res) => {
-      try {
-        const { reportId } = req.params;
-
-        if (!ObjectId.isValid(reportId)) {
-          return res.status(400).json({ success: false, message: "Invalid Report ID" });
-        }
-
-        // রিপোর্ট ডিলিট না করে স্ট্যাটাস 'dismissed' করে দেওয়া সবচেয়ে সেফ মেথড
-        await reportsCollection.updateOne(
-          { _id: new ObjectId(reportId) },
-          { $set: { status: "dismissed" } }
-        );
-
-        res.json({ success: true, message: "Report dismissed. Prompt is safe." });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
 
     // DONT TOUCH
     console.log("MongoDB connected successfully");
