@@ -125,85 +125,100 @@ async function run() {
 
     // ─── ২. অল প্রম্পটস মার্কেটপ্লেস API (WITH BLUR/LOCK LOGIC FOR PRIVATE PROMPTS) ───
     app.get("/prompts", async (req, res) => {
-      try {
-        const {
-          search,
-          category,
-          aiTool,
-          difficulty,
-          sortBy,
-          page = 1,
-          limit = 6,
-          email, // ফ্রন্টএন্ড থেকে পাঠানো ইউজারের ইমেইল (ঐচ্ছিক)
-        } = req.query;
+  try {
+    const {
+      search,
+      category,
+      aiTool,
+      difficulty,
+      sortBy,
+      page = 1,
+      limit = 6,
+      email, // ফ্রন্টএন্ড থেকে পাঠানো ইউজারের ইমেইল
+    } = req.query;
 
-        // মার্কেটপ্লেসে শুধুমাত্র approved প্রম্পট দেখাবে (public এবং private দুইটাই আসবে)
-        let query = { status: "approved" };
+    // মার্কেটপ্লেসে শুধুমাত্র approved প্রম্পট দেখাবে
+    let query = { status: "approved" };
 
-        if (search) {
-          query.$or = [
-            { title: { $regex: search, $options: "i" } },
-            { aiTool: { $regex: search, $options: "i" } },
-            { tags: { $in: [new RegExp(search, "i")] } },
-          ];
-        }
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { aiTool: { $regex: search, $options: "i" } },
+        { tags: { $in: [new RegExp(search, "i")] } },
+      ];
+    }
 
-        if (category) query.category = category;
-        if (aiTool) query.aiTool = aiTool;
-        if (difficulty) query.difficulty = difficulty;
+    if (category) query.category = category;
+    if (aiTool) query.aiTool = aiTool;
+    if (difficulty) query.difficulty = difficulty;
 
-        let sortOptions = { createdAt: -1 };
-        if (sortBy === "mostCopied") sortOptions = { copyCount: -1 };
-        if (sortBy === "mostPopular") sortOptions = { "reviews.rating": -1 };
+    let sortOptions = { createdAt: -1 };
+    if (sortBy === "mostCopied") sortOptions = { copyCount: -1 };
+    if (sortBy === "mostPopular") sortOptions = { "reviews.rating": -1 };
 
-        const skip = (parseInt(page) - 1) * parseInt(limit);
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        const prompts = await promptsCollection
-          .find(query)
-          .sort(sortOptions)
-          .skip(skip)
-          .limit(parseInt(limit))
-          .toArray();
+    const prompts = await promptsCollection
+      .find(query)
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit))
+      .toArray();
 
-        const totalDocuments = await promptsCollection.countDocuments(query);
+    const totalDocuments = await promptsCollection.countDocuments(query);
 
-        // ইউজার প্রিমিয়াম কিনা তা চেক করার লজিক
-        let isPremiumUser = false;
-        if (email) {
-          const user = await usersCollection.findOne({ email });
-          if (
-            user &&
-            (user.status === "Premium" ||
-              user.role === "creator" ||
-              user.role === "admin")
-          ) {
-            isPremiumUser = true;
-          }
-        }
-
-        // প্রসেসড ডেটা জেনারেট করা (প্রাইভেট প্রম্পট লক করার জন্য)
-        const processedPrompts = prompts.map((prompt) => {
-          let updatedPrompt = { ...prompt };
-          if (prompt.visibility === "private" && !isPremiumUser) {
-            updatedPrompt.promptContent = "LOCKED_PREMIUM"; // কন্টেন্ট হাইড করে ফ্ল্যাগ দেওয়া হলো
-          }
-          return updatedPrompt;
-        });
-
-        res.json({
-          success: true,
-          data: processedPrompts,
-          meta: {
-            total: totalDocuments,
-            page: parseInt(page),
-            limit: parseInt(limit),
-            totalPages: Math.ceil(totalDocuments / limit),
-          },
-        });
-      } catch (error) {
-        res.status(500).json({ error: error.message });
+    // ১. ইউজার প্রিমিয়াম মেম্বার বা এডমিন কিনা তা ডাটাবেজ থেকে চেক করা
+    let isPremiumUser = false;
+    if (email && email !== "undefined" && email !== "") {
+      const user = await usersCollection.findOne({ email });
+      // ক্রিয়েটর যদি ফ্রি প্ল্যানে থাকে, সে অন্যের প্রিমিয়াম কন্টেন্ট দেখতে পাবে না।
+      // তাই শুধুমাত্র user.status === "Premium" অথবা admin গ্লোবাল অ্যাক্সেস পাবে।
+      if (
+        user &&
+        (user.status === "Premium" || user.role === "admin")
+      ) {
+        isPremiumUser = true;
       }
+    }
+
+    // ২. প্রসেসড ডেটা জেনারেট করা
+    const processedPrompts = prompts.map((prompt) => {
+      let updatedPrompt = { ...prompt };
+      
+      const originalContent = prompt.promptContent || prompt.content || "";
+      
+      // চেক করি ইউজার নিজেই এই প্রম্পটের ক্রিয়েটর বা মালিক কিনা
+      const isAuthor = email && prompt.authorEmail === email;
+
+      // প্রম্পট যদি প্রাইভেট (Premium) হয় এবং ইউজার যদি প্রিমিয়াম না হয় প্লাস সে যদি মালিকও না হয়
+      if (prompt.visibility === "private" && !isPremiumUser && !isAuthor) {
+        updatedPrompt.content = "LOCKED_PREMIUM";
+        updatedPrompt.promptContent = "LOCKED_PREMIUM";
+      } else {
+        // প্রিমিয়াম ইউজার, এডমিন অথবা নিজের তৈরি প্রম্পট হলে কন্টেন্ট দেখা যাবে
+        updatedPrompt.content = originalContent;
+        updatedPrompt.promptContent = originalContent;
+      }
+      
+      return updatedPrompt;
     });
+
+    // 🎯 রেসপন্সে processedPrompts এর সাথে 'isPremiumUser' ফ্ল্যাগটি পাঠানো হলো
+    res.json({
+      success: true,
+      data: processedPrompts,
+      isPremiumUser: isPremiumUser, 
+      meta: {
+        total: totalDocuments,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(totalDocuments / limit),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
     // User Dashboard stats
     // আপনার ইউজার ড্যাশবোর্ডের ডেটার জন্য ব্যাকএন্ড রাউট
