@@ -12,7 +12,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// CORS - CORS/504/404 এরর এড়াতে credentials true সহ কনফিগারেশন
+// CORS কনফিগারেশন
 app.use(
   cors({
     origin: process.env.CLIENT_URL || true,
@@ -29,7 +29,7 @@ const client = new MongoClient(process.env.MONGODB_URI, {
   },
 });
 
-// ================= FIXED JWKS (Better Auth JWKS Endpoint) =================
+// ================= FIXED JWKS =================
 const JWKS = createRemoteJWKSet(
   new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
 );
@@ -52,10 +52,18 @@ const verifyToken = async (req, res, next) => {
 
   try {
     const { payload } = await jwtVerify(token, JWKS);
-    req.user = payload; // Better Auth টোকেন পে-লোড (sub, email, role, status ইত্যাদি থাকবে)
+
+    // Better-Auth এর বিভিন্ন ফরম্যাট হ্যান্ডেল করার জন্য ইমেইল এক্সট্র্যাকশন ফিক্স করা হলো
+    req.user = {
+      email: payload.email || payload.user?.email || payload.sub,
+      role: payload.role || "user",
+      name: payload.name || payload.user?.name,
+    };
+
+    console.log("👉 Dashboard API Hit By User:", req.user.email);
     next();
   } catch (err) {
-    console.log("JWT ERROR:", err);
+    console.error("JWT ERROR:", err);
     return res.status(403).json({ message: "Invalid or expired token" });
   }
 };
@@ -63,18 +71,14 @@ const verifyToken = async (req, res, next) => {
 // ================= MAIN FUNCTION =================
 async function run() {
   try {
-    // await client.connect(); // Vercel/Production deployment এর জন্য এটি কমেন্ট রাখাই ভালো
-
     const dbName = process.env.AUTH_DB_NAME || "PromptVerse";
     const db = client.db(dbName);
 
     console.log("DB Name:", db.databaseName);
 
-    console.log("Collections:", await db.listCollections().toArray());
-
-    // কালেকশন ডিক্লেয়ারেশন
     const usersCollection = db.collection("user");
     const promptsCollection = db.collection("prompts");
+    const reviewsCollection = db.collection("reviews");
     const bookmarksCollection = db.collection("bookmarks");
     const reportsCollection = db.collection("reports");
     const paymentsCollection = db.collection("payments");
@@ -84,9 +88,8 @@ async function run() {
       try {
         const prompt = req.body;
         const userEmail = req.user.email;
-        const userRole = req.user.role || "user"; // Default role if not present
+        const userRole = req.user.role || "user";
 
-        // রিকোয়ারমেন্ট: ফ্রি ইউজাররা (role === 'user') সর্বোচ্চ ৩টি প্রম্পট অ্যাড করতে পারবে
         if (userRole === "user") {
           const count = await promptsCollection.countDocuments({
             authorEmail: userEmail,
@@ -106,7 +109,8 @@ async function run() {
           authorRole: userRole,
           copyCount: 0,
           reviews: [],
-          status: "pending", // রিকোয়ারমেন্ট: নতুন প্রম্পট ডিফল্টভাবে pending থাকবে
+          status: "pending",
+          visibility: prompt.visibility || "public", // ডিফল্ট বা ইউজার সিলেক্টেড ভিজিবিলিটি
           createdAt: new Date(),
         };
 
@@ -117,7 +121,7 @@ async function run() {
       }
     });
 
-    // ─── ২. অল প্রম্পটস মার্কেটপ্লেস API (PUBLIC - SEARCH, FILTER, SORT, PAGINATION) ───
+    // ─── ২. অল প্রম্পটস মার্কেটপ্লেস API (WITH BLUR/LOCK LOGIC FOR PRIVATE PROMPTS) ───
     app.get("/prompts", async (req, res) => {
       try {
         const {
@@ -128,12 +132,12 @@ async function run() {
           sortBy,
           page = 1,
           limit = 6,
+          email, // ফ্রন্টএন্ড থেকে পাঠানো ইউজারের ইমেইল (ঐচ্ছিক)
         } = req.query;
 
-        // মার্কেটপ্লেসে শুধুমাত্র approved এবং public প্রম্পট দেখাবে
-        let query = { status: "approved", visibility: "public" };
+        // মার্কেটপ্লেসে শুধুমাত্র approved প্রম্পট দেখাবে (public এবং private দুইটাই আসবে)
+        let query = { status: "approved" };
 
-        // ১. সার্চ লজিক (Title, Tags, AI Tool)
         if (search) {
           query.$or = [
             { title: { $regex: search, $options: "i" } },
@@ -142,17 +146,14 @@ async function run() {
           ];
         }
 
-        // ২. ফিল্টার লজিক
         if (category) query.category = category;
         if (aiTool) query.aiTool = aiTool;
         if (difficulty) query.difficulty = difficulty;
 
-        // ৩. সর্ট লজিক
-        let sortOptions = { createdAt: -1 }; // Default: Latest
+        let sortOptions = { createdAt: -1 };
         if (sortBy === "mostCopied") sortOptions = { copyCount: -1 };
-        if (sortBy === "mostPopular") sortOptions = { "reviews.rating": -1 }; // রেটিং অনুযায়ী
+        if (sortBy === "mostPopular") sortOptions = { "reviews.rating": -1 };
 
-        // ৪. পেজিনেশন লজিক
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
         const prompts = await promptsCollection
@@ -164,9 +165,32 @@ async function run() {
 
         const totalDocuments = await promptsCollection.countDocuments(query);
 
+        // ইউজার প্রিমিয়াম কিনা তা চেক করার লজিক
+        let isPremiumUser = false;
+        if (email) {
+          const user = await usersCollection.findOne({ email });
+          if (
+            user &&
+            (user.status === "Premium" ||
+              user.role === "creator" ||
+              user.role === "admin")
+          ) {
+            isPremiumUser = true;
+          }
+        }
+
+        // প্রসেসড ডেটা জেনারেট করা (প্রাইভেট প্রম্পট লক করার জন্য)
+        const processedPrompts = prompts.map((prompt) => {
+          let updatedPrompt = { ...prompt };
+          if (prompt.visibility === "private" && !isPremiumUser) {
+            updatedPrompt.promptContent = "LOCKED_PREMIUM"; // কন্টেন্ট হাইড করে ফ্ল্যাগ দেওয়া হলো
+          }
+          return updatedPrompt;
+        });
+
         res.json({
           success: true,
-          data: prompts,
+          data: processedPrompts,
           meta: {
             total: totalDocuments,
             page: parseInt(page),
@@ -179,12 +203,93 @@ async function run() {
       }
     });
 
-    // ─── ৩. ক্রিয়েটর ড্যাশবোর্ড অ্যানালিটিক্স (SECURED - MONGODB AGGREGATION) ───
+    // User Dashboard stats
+    // আপনার ইউজার ড্যাশবোর্ডের ডেটার জন্য ব্যাকএন্ড রাউট
+    app.get("/user/dashboard-stats", verifyToken, async (req, res) => {
+      try {
+        const userEmail = req.user?.email;
+
+        // ইউজার নিজে কয়টা প্রম্পট অ্যাড করেছে তার রিয়াল কাউন্ট (ডক রিকোয়ারমেন্ট ৩টি লিমিটের জন্য)
+        const promptCount = await promptsCollection.countDocuments({
+          authorEmail: userEmail,
+        });
+
+        const savedCount = await bookmarksCollection.countDocuments({
+          userEmail: userEmail,
+        });
+        const reviewCount = await reviewsCollection.countDocuments({
+          email: userEmail,
+        });
+
+        const userInfo = await usersCollection.findOne({ email: userEmail });
+        const subscription = userInfo?.subscription || "Free";
+
+        return res.status(200).json({
+          success: true,
+          stats: {
+            savedCount,
+            reviewCount,
+            subscription,
+            promptCount: promptCount || 0, // এই যে ডাইনামিক কাউন্ট পাঠিয়ে দিলাম!
+          },
+        });
+      } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+      }
+    });
+
+    // ─── ১২.১. কারেন্ট ইউজারের নিজের দেওয়া সব রিভিউ এর লিস্ট ───
+    app.get("/my-reviews", verifyToken, async (req, res) => {
+      try {
+        const userEmail = req.user.email;
+
+        // database theke shudhu oi prompt gulo nibe jekhane "reviews" list er bhetor amar email ase
+        const myReviewedPrompts = await promptsCollection
+          .aggregate([
+            { $match: { "reviews.email": userEmail } },
+            {
+              $project: {
+                _id: 1,
+                title: 1,       // Prompt er Title
+                category: 1,    // Prompt er Category
+                aiTool: 1,      // Prompt er AI Tool (যেমন: ChatGPT, Midjourney)
+                // dynamic bhabe prompt er reviews array theke shudhu amr review-ta filter kore ana
+                myReviewDetails: {
+                  $filter: {
+                    input: "$reviews",
+                    as: "review",
+                    cond: { $eq: ["$$review.email", userEmail] }
+                  }
+                }
+              }
+            },
+            { $unwind: "$myReviewDetails" },
+            {
+              $project: {
+                _id: 1,
+                promptTitle: "$title",
+                category: 1,
+                aiTool: 1,
+                rating: "$myReviewDetails.rating",
+                comment: "$myReviewDetails.comment",
+                date: "$myReviewDetails.date"
+              }
+            }
+          ])
+          .toArray();
+
+        res.json({ success: true, data: myReviewedPrompts });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // ─── ৩. ক্রিয়েটর ড্যাশবোর্ড অ্যানালিটিক্স ───
     app.get("/creator/analytics", verifyToken, async (req, res) => {
       try {
         const userEmail = req.user.email;
 
-        // মঙ্গোডিবি অ্যাগ্রিগেশন পাইপলাইন ব্যবহার করে প্রম্পটের টোটাল কাউন্ট এবং টোটাল কপির যোগফল বের করা
+        // ১. সামারি স্ট্যাটস (Total Prompts, Total Copies)
         const statsAggregation = await promptsCollection
           .aggregate([
             { $match: { authorEmail: userEmail } },
@@ -198,9 +303,9 @@ async function run() {
           ])
           .toArray();
 
-        // বুকমার্ক কাউন্ট বের করা
+        // ২. বুকমার্ক কাউন্ট
         const totalBookmarks = await bookmarksCollection.countDocuments({
-          authorEmail: userEmail,
+          authorEmail: userEmail, // ডক অনুযায়ী যে প্রম্পটগুলো এই ইউজারের বুকমার্ক করা
         });
 
         const stats = statsAggregation[0]
@@ -211,32 +316,42 @@ async function run() {
             }
           : { totalPrompts: 0, totalCopies: 0, totalBookmarks: 0 };
 
-        // Recharts গ্রাফের জন্য ডেটা প্রিপেয়ার করা (গ্রোথ অ্যানালিটিক্স)
+        // ৩. চার্ট ডাটা (ডক রিকোয়ারমেন্ট: Total Copies & Prompt Growth)
         const chartDataAggregation = await promptsCollection
           .aggregate([
             { $match: { authorEmail: userEmail } },
             {
               $group: {
+                // মাসের নাম অনুযায়ী গ্রুপ (যেমন: Jan, Feb, Mar)
                 _id: { $dateToString: { format: "%b", date: "$createdAt" } },
-                copies: { $sum: "$copyCount" },
+                copies: { $sum: "$copyCount" }, // Total Copies
+                promptCount: { $sum: 1 }, // Prompt Growth (কয়টা প্রম্পট যোগ হইছে)
               },
             },
-            { $project: { name: "$_id", copies: 1, _id: 0 } },
+            {
+              $project: {
+                name: "$_id",
+                copies: 1,
+                prompts: "$promptCount", // Recharts-এ ব্যবহারের জন্য সহজ নাম
+                _id: 0,
+              },
+            },
+            // মাসের ক্রমানুসারে সাজানোর জন্য (ঐচ্ছিক কিন্তু সুন্দর দেখাবে)
+            { $sort: { name: 1 } },
           ])
           .toArray();
 
-        // চার্টের মাসের সিকোয়েন্স ঠিক রাখার জন্য মান্থলি অর্ডারিং ম্যাপ করা যেতে পারে, অথবা ডিরেক্ট পাঠানো যায়
         res.json({ success: true, stats, chartData: chartDataAggregation });
       } catch (error) {
         res.status(500).json({ error: error.message });
       }
     });
 
-    // ─── ৪. একক প্রম্পট ডিটেইলস ও প্রিমিয়াম লক হ্যান্ডেল (PUBLIC/OPTIONAL AUTH) ───
+    // ─── ৪. একক প্রম্পট ডিটেইলস ও প্রিমিয়াম লক হ্যান্ডেল ───
     app.get("/prompts/:id", async (req, res) => {
       try {
         const id = req.params.id;
-        const userEmail = req.query.email; // ফ্রন্টএন্ড থেকে কুয়েরি প্যারামিটারে লগইন থাকা ইউজারের ইমেইল আসবে
+        const userEmail = req.query.email;
 
         if (!ObjectId.isValid(id)) {
           return res
@@ -253,7 +368,6 @@ async function run() {
             .json({ success: false, message: "Prompt not found" });
         }
 
-        // ইউজার প্রিমিয়াম, ক্রিয়েটর নাকি অ্যাডমিন তা চেক করা হচ্ছে
         let isPremiumUser = false;
         if (userEmail) {
           const user = await usersCollection.findOne({ email: userEmail });
@@ -267,13 +381,11 @@ async function run() {
           }
         }
 
-        // রিকোয়ারমেন্ট: Private (Premium) প্রম্পট হলে কন্টেন্ট লক করে দেওয়া হবে যদি ইউজার প্রিমিয়াম না হয়
         let responseData = { ...prompt };
         if (prompt.visibility === "private" && !isPremiumUser) {
-          responseData.promptContent = "LOCKED_PREMIUM"; // ফ্রন্টএন্ডে এটি দেখে ব্লার/লক মেসেজ দেখাবেন
+          responseData.promptContent = "LOCKED_PREMIUM";
         }
 
-        // বুকমার্ক স্ট্যাটাস চেক
         let bookmarked = false;
         if (userEmail) {
           const bookmarkExists = await bookmarksCollection.findOne({
@@ -294,7 +406,7 @@ async function run() {
       }
     });
 
-    // ─── ৫. বুকমার্ক টগল API (SECURED) ───
+    // ─── ৫. বুকমার্ক টগল API ───
     app.post("/prompts/:id/bookmark", verifyToken, async (req, res) => {
       try {
         const promptId = req.params.id;
@@ -326,7 +438,7 @@ async function run() {
       }
     });
 
-    // ─── ৬. কপি কাউন্ট বাড়ানোর API (PUBLIC/PATCH) ───
+    // ─── ৬. কপি কাউন্ট বাড়ানোর API ───
     app.patch("/prompts/:id/copy", async (req, res) => {
       try {
         const id = req.params.id;
@@ -343,7 +455,7 @@ async function run() {
       }
     });
 
-    // ─── ৭. রিভিউ ও রেটিং অ্যাড করার API (SECURED) ───
+    // ─── ৭. রিভিউ ও রেটিং অ্যাড করার API ───
     app.post("/prompts/:id/reviews", verifyToken, async (req, res) => {
       try {
         const promptId = req.params.id;
@@ -373,7 +485,7 @@ async function run() {
       }
     });
 
-    // ─── ৮. রিপোর্ট সাবমিট করার API (SECURED) ───
+    // ─── ৮. রিপোর্ট সাবমিট করার API ───
     app.post("/prompts/:id/report", verifyToken, async (req, res) => {
       try {
         const promptId = req.params.id;
@@ -396,7 +508,7 @@ async function run() {
       }
     });
 
-    // ─── ৯. পেমেন্ট সাকসেস হ্যান্ডেলার (SECURED) ───
+    // ─── ৯. পেমেন্ট সাকসেস হ্যান্ডেলার ───
     app.post("/payments/success", verifyToken, async (req, res) => {
       try {
         const userEmail = req.user.email;
@@ -409,10 +521,10 @@ async function run() {
           date: new Date(),
         });
 
-        // ইউজার কালেকশনে স্ট্যাটাস Premium করে দেওয়া
-        await db
-          .collection("users")
-          .updateOne({ email: userEmail }, { $set: { status: "Premium" } });
+        await usersCollection.updateOne(
+          { email: userEmail },
+          { $set: { status: "Premium" } },
+        );
 
         res.json({
           success: true,
@@ -423,27 +535,22 @@ async function run() {
       }
     });
 
-    // ─── ১০. কারেন্ট ইউজারের নিজস্ব প্রম্পট লিস্ট পাওয়ার API (SECURED) ───
+    // ─── ১০. কারেন্ট ইউজারের নিজস্ব প্রম্পট লিস্ট ───
     app.get("/my-prompts", verifyToken, async (req, res) => {
       try {
-        const userEmail = req.user.email; // টোকেন থেকে ইউজারের ইমেইল নেওয়া হচ্ছে
-
-        // শুধুমাত্র এই ইউজারের প্রম্পটগুলোই ডেটাবেজ থেকে খোঁজা হবে
+        const userEmail = req.user.email;
         const userPrompts = await promptsCollection
           .find({ authorEmail: userEmail })
-          .sort({ createdAt: -1 }) // লেটেস্টগুলো আগে দেখাবে
+          .sort({ createdAt: -1 })
           .toArray();
 
-        res.json({
-          success: true,
-          data: userPrompts,
-        });
+        res.json({ success: true, data: userPrompts });
       } catch (error) {
         res.status(500).json({ success: false, error: error.message });
       }
     });
 
-    // ─── ১১. প্রম্পট ডিলিট করার API (SECURED) ───
+    // ─── ১১. প্রম্পট ডিলিট করার API ───
     app.delete("/prompts/:id", verifyToken, async (req, res) => {
       try {
         const id = req.params.id;
@@ -455,7 +562,6 @@ async function run() {
             .json({ success: false, message: "Invalid ID" });
         }
 
-        // সিকিউরিটি চেক: ইউজার নিজের প্রম্পট ছাড়া অন্যের প্রম্পট ডিলিট করতে পারবে না
         const result = await promptsCollection.deleteOne({
           _id: new ObjectId(id),
           authorEmail: userEmail,
@@ -476,236 +582,79 @@ async function run() {
       }
     });
 
-    // ─── ১২. কারেন্ট ইউজারের বুকমার্ক করা প্রম্পট লিস্ট পাওয়ার API (SECURED - AGGREGATION) ───
+    // ─── ১২. কারেন্ট ইউজারের বুকমার্ক করা প্রম্পট লিস্ট ───
     app.get("/my-bookmarks", verifyToken, async (req, res) => {
       try {
         const userEmail = req.user.email;
 
-        // Aggregation Pipeline ব্যবহার করে bookmarks এর সাথে prompts কালেকশন জয়েন করা হচ্ছে
         const bookmarkedPrompts = await bookmarksCollection
           .aggregate([
-            {
-              $match: { userEmail: userEmail },
-            },
+            { $match: { userEmail: userEmail } },
+            { $match: { promptId: { $regex: "^[0-9a-fA-F]{24}$" } } },
             {
               $addFields: {
-                promptObjectId: { $toObjectId: "$promptId" }, // string promptId কে ObjectId তে কনভার্ট
+                promptObjectId: { $toObjectId: "$promptId" },
               },
             },
             {
               $lookup: {
-                from: "prompts", // যে কালেকশনের সাথে জয়েন হবে
-                localField: "promptObjectId", // bookmarks কালেকশনের ফিল্ড
-                foreignField: "_id", // prompts কালেকশনের ফিল্ড
-                as: "promptDetails", // আউটপুট ফিল্ডের নাম
+                from: "prompts",
+                localField: "promptObjectId",
+                foreignField: "_id",
+                as: "promptDetails",
               },
             },
-            {
-              $unwind: "$promptDetails", // অ্যারে থেকে অবজেক্টে নিয়ে আসা
-            },
+            { $unwind: "$promptDetails" },
             {
               $project: {
-                _id: "$promptDetails._id", // প্রম্পটের অরিজিনাল আইডি পাস করা যাতে ফ্রন্টএন্ডে সুবিধা হয়
-                bookmarkId: "$_id", // বুকমার্কের নিজস্ব আইডি
+                _id: "$promptDetails._id",
+                bookmarkId: "$_id",
                 title: "$promptDetails.title",
                 category: "$promptDetails.category",
                 aiTool: "$promptDetails.aiTool",
                 copyCount: "$promptDetails.copyCount",
-                authorEmail: "$promptDetails.authorEmail", // ক্রিয়েটরের ইমেইল বা নাম ট্র্যাকের জন্য
+                authorEmail: "$promptDetails.authorEmail",
               },
             },
           ])
           .toArray();
 
-        res.json({
-          success: true,
-          data: bookmarkedPrompts,
-        });
+        res.json({ success: true, data: bookmarkedPrompts });
       } catch (error) {
         res.status(500).json({ success: false, error: error.message });
       }
     });
 
-    // ─── ১৩. কারেন্ট ইউজারের দেওয়া সব রিভিউ ও রেটিং পাওয়ার API (SECURED - AGGREGATION) ───
-    app.get("/my-reviews", verifyToken, async (req, res) => {
-      try {
-        const userEmail = req.user.email; // টোকেন থেকে লগইন করা ইউজারের ইমেইল নেওয়া হচ্ছে
-
-        const myReviews = await promptsCollection
-          .aggregate([
-            // ১. শুধুমাত্র যে প্রম্পটগুলোতে রিভিউ অ্যারে খালি না সেগুলো ফিল্টার করা
-            { $match: { "reviews.email": userEmail } },
-
-            // ২. রিভিউ অ্যারে ভেঙে সিঙ্গেল অবজেক্টে রূপান্তর করা
-            { $unwind: "$reviews" },
-
-            // ৩. শুধুমাত্র কারেন্ট ইউজারের করা রিভিউগুলো ম্যাচ করা
-            { $match: { "reviews.email": userEmail } },
-
-            // ৪. ফ্রন্টএন্ডের মক ডাটা ফরম্যাটের সাথে ফিল্ডগুলো ম্যাচ করে প্রজেক্ট করা
-            {
-              $project: {
-                _id: { $concat: [{ $toString: "$_id" }, "-", "$reviews.date"] }, // ইউনিক কি জেনারেট
-                promptId: "$_id",
-                promptTitle: "$title",
-                rating: "$reviews.rating",
-                comment: "$reviews.comment",
-                createdAt: "$reviews.date", // রিভিউ দেওয়ার ডেট
-              },
-            },
-          ])
-          .toArray();
-
-        res.json({
-          success: true,
-          data: myReviews,
-        });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    // ─── ১৪. ইউজার ড্যাশবোর্ড ওভারভিউ স্ট্যাটস API (SECURED) ───
-    app.get("/user/dashboard-stats", verifyToken, async (req, res) => {
-      try {
-        const userEmail = req.user.email;
-
-        // ১. ইউজারের সাবস্ক্রিপশন বা প্ল্যান স্ট্যাটাস দেখা (users কালেকশন থেকে)
-        const user = await usersCollection.findOne({ email: userEmail });
-        const subscription = user?.status || "Free";
-
-        // ২. টোটাল বুকমার্ক বা সেভ করা প্রম্পটের সংখ্যা বের করা
-        const savedCount = await bookmarksCollection.countDocuments({
-          userEmail,
-        });
-
-        // ৩. ইউজারের দেওয়া টোটাল রিভিউ কাউন্ট বের করা (prompts এর ভেতরের reviews অ্যারে ফিল্টার)
-        const reviewStats = await promptsCollection
-          .aggregate([
-            { $match: { "reviews.email": userEmail } },
-            { $unwind: "$reviews" },
-            { $match: { "reviews.email": userEmail } },
-            { $count: "totalReviews" },
-          ])
-          .toArray();
-
-        const reviewCount = reviewStats[0]?.totalReviews || 0;
-
-        // ৪. রিসেন্ট অ্যাক্টিভিটি জেনারেট করা (ডাটাবেজের রিয়েল ডাটা অনুযায়ী মিক্সড হিস্ট্রি)
-        const recentSaved = await bookmarksCollection
-          .find({ userEmail })
-          .sort({ createdAt: -1 })
-          .limit(2)
-          .toArray();
-
-        const activities = [];
-        recentSaved.forEach((b, index) => {
-          activities.push({
-            id: `b_${index}`,
-            message: "You bookmarked a prompt from the marketplace",
-            time: b.createdAt
-              ? new Date(b.createdAt).toLocaleDateString()
-              : "Recently",
-          });
-        });
-
-        if (activities.length === 0) {
-          activities.push({
-            id: "def_1",
-            message:
-              "Welcome to PromptVerse! Explore the marketplace to add activity.",
-            time: "Just now",
-          });
-        }
-
-        res.json({
-          success: true,
-          stats: {
-            savedCount,
-            reviewCount,
-            subscription,
-          },
-          activities,
-        });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    // ─── GET USER PROMPT COUNT (SECURED) ───
-    app.get("/prompts/count/:email", verifyToken, async (req, res) => {
-      try {
-        const email = req.params.email;
-
-        // অন্য কারো count দেখতে পারবে না
-        if (req.user.email !== email) {
-          return res.status(403).json({
-            success: false,
-            message: "Forbidden",
-          });
-        }
-
-        const count = await promptsCollection.countDocuments({
-          authorEmail: email,
-        });
-
-        res.json({
-          success: true,
-          count,
-        });
-      } catch (error) {
-        res.status(500).json({
-          success: false,
-          message: error.message,
-        });
-      }
-    });
-
-    // =============ADMIN==============
-    // আপনার JWT ভেরিফাই করার পর এই মিডলওয়্যারটি চলবে
+    // ─── 🔑 [ADMIN ONLY ENDPOINTS] ───
     const verifyAdmin = async (req, res, next) => {
       try {
         const email = req.user?.email;
-
-        const user = await usersCollection.findOne({ email }); // ✅ usersCollection
-
-        console.log("DB User:", user);
+        const user = await usersCollection.findOne({ email });
 
         if (!user || user.role !== "admin") {
-          return res.status(403).json({
-            message: "Forbidden Access! Admin only.",
-          });
+          return res
+            .status(403)
+            .json({ message: "Forbidden Access! Admin only." });
         }
-
         next();
       } catch (error) {
         console.error("Verify Admin Error:", error);
-        res.status(500).json({
-          message: "Internal Server Error",
-        });
+        res.status(500).json({ message: "Internal Server Error" });
       }
     };
 
-    // ১. অ্যানালিটিক্স API (SECURED - Total Users, Prompts, Reviews, Copies)
     app.get("/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const totalUsers = await usersCollection.countDocuments();
         const totalPrompts = await promptsCollection.countDocuments();
 
-        // মঙ্গোডিবি অ্যাগ্রিগেশন পাইপলাইন দিয়ে সব প্রম্পটের টোটাল কপির যোগফল বের করা
         const copyStats = await promptsCollection
           .aggregate([
-            {
-              $group: {
-                _id: null,
-                totalCopies: { $sum: "$copyCount" },
-              },
-            },
+            { $group: { _id: null, totalCopies: { $sum: "$copyCount" } } },
           ])
           .toArray();
         const totalCopies = copyStats[0]?.totalCopies || 0;
 
-        // মঙ্গোডিবি অ্যাগ্রিগেশন পাইপলাইন দিয়ে সব প্রম্পটের মোট রিভিউ সংখ্যা বের করা
         const reviewStats = await promptsCollection
           .aggregate([{ $unwind: "$reviews" }, { $count: "totalReviews" }])
           .toArray();
@@ -720,32 +669,28 @@ async function run() {
       }
     });
 
-    // ২. সব ইউজারদের ডাটা নিয়ে আসার API (SECURED)
     app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const result = await usersCollection.find().toArray();
-        res.json(result); // ফ্রন্টএন্ড সরাসরি অ্যারে আশা করছে
+        res.json(result);
       } catch (error) {
         res.status(500).json({ success: false, error: error.message });
       }
     });
 
-    // ৩. ইউজারের রোল পরিবর্তন করার API (SECURED)
     app.patch("/users/role/:id", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const id = req.params.id;
         const { role } = req.body;
-
-        if (!ObjectId.isValid(id)) {
+        if (!ObjectId.isValid(id))
           return res
             .status(400)
             .json({ success: false, message: "Invalid User ID" });
-        }
 
-        const filter = { _id: new ObjectId(id) };
-        const updateDoc = { $set: { role: role } };
-
-        const result = await usersCollection.updateOne(filter, updateDoc);
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { role } },
+        );
         res.json({
           success: true,
           message: "User role updated successfully",
@@ -756,57 +701,36 @@ async function run() {
       }
     });
 
-    // ৪. সব প্রম্পট দেখার API (SECURED)
     app.get("/admin/prompts", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const result = await promptsCollection
-      .find()
-      .sort({ createdAt: -1 })
-      .toArray();
+      try {
+        const result = await promptsCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json({ success: true, prompts: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
 
-    // সেফটি ম্যাপ: প্রম্পট অবজেক্টে যে নামেই আইডি থাকুক, আমরা ফ্রন্টএন্ডের জন্য একটা ফিক্সড 'creatorId' বানিয়ে দিচ্ছি
-    const formattedPrompts = result.map(prompt => ({
-      ...prompt,
-      creatorId: prompt.userId || prompt.authorId || prompt.user || prompt._userId || null
-    }));
-    
-    res.json({ 
-      success: true, 
-      prompts: formattedPrompts 
-    }); 
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-    // ৫. প্রম্পট Approve বা Reject করার API (SECURED)
-    app.patch(
-      "/prompts/status/:id",
+    app.put(
+      "/admin/prompts/:id/approve",
       verifyToken,
       verifyAdmin,
       async (req, res) => {
         try {
           const id = req.params.id;
-          const { status, feedback } = req.body; // status: 'approved' বা 'rejected'
-
-          if (!ObjectId.isValid(id)) {
+          if (!ObjectId.isValid(id))
             return res
               .status(400)
-              .json({ success: false, message: "Invalid Prompt ID" });
-          }
-
-          const filter = { _id: new ObjectId(id) };
-          const updateDoc = {
-            $set: {
-              status: status,
-              feedback: feedback || "",
-            },
-          };
-
-          const result = await promptsCollection.updateOne(filter, updateDoc);
+              .json({ success: false, message: "Invalid ID" });
+          const result = await promptsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { status: "approved" } },
+          );
           res.json({
             success: true,
-            message: `Prompt status updated to ${status}`,
+            message: "Prompt approved successfully",
             result,
           });
         } catch (error) {
@@ -815,97 +739,46 @@ async function run() {
       },
     );
 
-    // নতুন ১. ডেডিকেটেড Approve API (PUT রিকোয়েস্ট)
-app.put("/admin/prompts/:id/approve", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const id = req.params.id;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid Prompt ID" });
-    }
-    const filter = { _id: new ObjectId(id) };
-    const updateDoc = { $set: { status: "approved" } };
-    const result = await promptsCollection.updateOne(filter, updateDoc);
-    res.json({ success: true, message: "Prompt approved successfully", result });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+    app.put(
+      "/admin/prompts/:id/reject",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+          const { feedback } = req.body;
+          if (!ObjectId.isValid(id))
+            return res
+              .status(400)
+              .json({ success: false, message: "Invalid ID" });
+          const result = await promptsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { status: "Rejected", feedback: feedback || "" } },
+          );
+          res.json({
+            success: true,
+            message: "Prompt rejected successfully",
+            result,
+          });
+        } catch (error) {
+          res.status(500).json({ success: false, error: error.message });
+        }
+      },
+    );
 
-// নতুন ২. ডেডিকেটেড Reject API (PUT রিকোয়েস্ট)
-app.put("/admin/prompts/:id/reject", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const id = req.params.id;
-    const { feedback } = req.body;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid Prompt ID" });
-    }
-    const filter = { _id: new ObjectId(id) };
-    const updateDoc = { $set: { status: "Rejected", feedback: feedback || "" } };
-    const result = await promptsCollection.updateOne(filter, updateDoc);
-    res.json({ success: true, message: "Prompt rejected successfully", result });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// নতুন ৩. অ্যাডমিন ইউজার ডিলিট API (নতুন ফ্রন্টএন্ড রাউটিং অনুসারে)
-app.delete("/admin/users/:identifier", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const { identifier } = req.params;
-    let query = {};
-
-    // চেক করা হচ্ছে প্যারামসটি ইমেইল নাকি মঙ্গোডিবি আইডি
-    if (identifier.includes("@")) {
-      query = { email: identifier };
-    } else {
-      // যদি আইডি হয় তবে ObjectId দিয়ে কোয়েরি হবে
-      const { ObjectId } = require("mongodb");
-      query = { _id: new ObjectId(identifier) };
-    }
-
-    const result = await usersCollection.deleteOne(query);
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, message: "User not found!" });
-    }
-
-    res.json({ success: true, message: "User deleted successfully!" });
-  } catch (error) {
-    console.error("Delete user error:", error);
-    res.status(500).json({ success: false, message: "Invalid user id or email format" });
-  }
-});
-
-    // ৬. সব পেমেন্ট ডাটা tabular ফর্মে দেখানোর API (SECURED)
-    app.get("/admin/payments", verifyToken, verifyAdmin, async (req, res) => {
-      try {
-        const result = await paymentsCollection
-          .find()
-          .sort({ date: -1 })
-          .toArray();
-        res.json({ success: true, data: result });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    // ৭. সব রিপোর্টেড প্রম্পট দেখার API (SECURED)
     app.get(
       "/admin/reported-prompts",
       verifyToken,
       verifyAdmin,
       async (req, res) => {
         try {
-          // Aggregation ব্যবহার করে reports কালেকশনের সাথে prompts কালেকশন জয়েন করা
           const reportedPrompts = await reportsCollection
             .aggregate([
-              {
-                $addFields: { promptObjectId: { $toObjectId: "$promptId" } },
-              },
+              { $match: { promptId: { $type: "objectId" } } },
               {
                 $lookup: {
                   from: "prompts",
-                  localField: "promptObjectId",
+                  localField: "promptId",
                   foreignField: "_id",
                   as: "promptDetails",
                 },
@@ -926,7 +799,6 @@ app.delete("/admin/users/:identifier", verifyToken, verifyAdmin, async (req, res
               },
             ])
             .toArray();
-
           res.json({ success: true, data: reportedPrompts });
         } catch (error) {
           res.status(500).json({ success: false, error: error.message });
@@ -934,35 +806,40 @@ app.delete("/admin/users/:identifier", verifyToken, verifyAdmin, async (req, res
       },
     );
 
-    // ৮. ইউজার ডিলিট করার API (SECURED - শুধু অ্যাডমিন পারবে)
-app.delete('/users/:id', verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const id = req.params.id;
+    app.delete(
+      "/admin/users/:identifier",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { identifier } = req.params;
+          let query = identifier.includes("@")
+            ? { email: identifier }
+            : { _id: new ObjectId(identifier) };
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid User ID" });
-    }
+          if (req.user.sub === identifier || req.user.email === identifier) {
+            return res
+              .status(400)
+              .json({
+                success: false,
+                message: "You cannot delete your own admin account!",
+              });
+          }
 
-    // নিজের অ্যাকাউন্ট যাতে নিজে ডিলিট না করে ফেলে তার জন্য একটি সেফটি চেক (ঐচ্ছিক)
-    if (req.user.sub === id || req.user.id === id) {
-      return res.status(400).json({ success: false, message: "You cannot delete your own admin account!" });
-    }
+          const result = await usersCollection.deleteOne(query);
+          if (result.deletedCount === 0)
+            return res
+              .status(404)
+              .json({ success: false, message: "User not found" });
 
-    const filter = { _id: new ObjectId(id) };
-    const result = await usersCollection.deleteOne(filter);
+          res.json({ success: true, message: "User deleted successfully" });
+        } catch (error) {
+          res.status(500).json({ success: false, error: error.message });
+        }
+      },
+    );
 
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, message: "User not found" });
-    }
-
-    res.json({ success: true, message: "User deleted successfully" });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-    // DONT TOUCH
-    console.log("MongoDB connected successfully via JWKS architecture");
+    console.log("MongoDB connected successfully");
   } finally {
     // Keep alive
   }
