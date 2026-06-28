@@ -9,6 +9,8 @@ const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
 
 dotenv.config();
 
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -508,12 +510,33 @@ async function run() {
       }
     });
 
+    // ─── ৮.৫ স্ট্রাইপ পেমেন্ট ইনটেন্ট তৈরি (নতুন যোগ করতে হবে) ───
+    app.post("/create-payment-intent", verifyToken, async (req, res) => {
+      try {
+        const price = 500; // $5.00 কে সেন্টে কনভার্ট করা হয়েছে (5 * 100)
+
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: price,
+          currency: "usd",
+          payment_method_types: ["card"],
+        });
+
+        res.json({
+          success: true,
+          clientSecret: paymentIntent.client_secret,
+        });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
     // ─── ৯. পেমেন্ট সাকসেস হ্যান্ডেলার ───
     app.post("/payments/success", verifyToken, async (req, res) => {
       try {
         const userEmail = req.user.email;
         const { transactionId, amount } = req.body;
 
+        // ১. পেমেন্ট কালেকশনে ডাটা ইনসার্ট করা
         await paymentsCollection.insertOne({
           transactionId,
           email: userEmail,
@@ -521,9 +544,10 @@ async function run() {
           date: new Date(),
         });
 
+        // ২. ইউজার কালেকশনে স্ট্যাটাস এবং সাবস্ক্রিপশন দুটিই "Premium" করে দেওয়া (এখানেই পরিবর্তন করবেন)
         await usersCollection.updateOne(
           { email: userEmail },
-          { $set: { status: "Premium" } },
+          { $set: { subscription: "Premium", status: "Premium" } },
         );
 
         res.json({
@@ -534,7 +558,6 @@ async function run() {
         res.status(500).json({ error: error.message });
       }
     });
-
     // ─── ১০. কারেন্ট ইউজারের নিজস্ব প্রম্পট লিস্ট ───
     app.get("/my-prompts", verifyToken, async (req, res) => {
       try {
@@ -899,12 +922,10 @@ async function run() {
           }
 
           if (!creatorEmail) {
-            return res
-              .status(400)
-              .json({
-                success: false,
-                message: "Creator email is required to warn",
-              });
+            return res.status(400).json({
+              success: false,
+              message: "Creator email is required to warn",
+            });
           }
 
           // ১. ইউজার কালেকশনে ওই ক্রিয়েটরের warningsCount ১ বাড়িয়ে দিই
