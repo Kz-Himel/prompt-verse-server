@@ -1177,6 +1177,7 @@ async function run() {
     });
 
     // DONT TOUCH
+    // await client.db("admin").command({ ping: 1 });
     console.log("MongoDB connected successfully");
   } finally {
     // Keep alive
