@@ -915,6 +915,35 @@ async function run() {
       }
     });
 
+    // DELETE from all prompts
+    app.delete(
+      "/admin/prompts/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+
+          const query = { _id: new ObjectId(id) };
+
+          const result = await promptsCollection.deleteOne(query);
+
+          if (result.deletedCount === 1) {
+            res.json({
+              success: true,
+              message: "Prompt deleted successfully!",
+            });
+          } else {
+            res
+              .status(404)
+              .json({ success: false, message: "Prompt not found!" });
+          }
+        } catch (error) {
+          res.status(500).json({ success: false, message: error.message });
+        }
+      },
+    );
+
     app.get("/payments", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const payments = await paymentsCollection
