@@ -988,7 +988,7 @@ async function run() {
     );
 
     app.delete(
-      "/admin/users/:identifier(.*)",
+      "/admin/users/:identifier",
       verifyToken,
       verifyAdmin,
       async (req, res) => {
