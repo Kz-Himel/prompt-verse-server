@@ -1102,7 +1102,7 @@ async function run() {
 
     // CRITICAL: Placed at the bottom to avoid hijacking other specific routes due to optional param (:identifier?)
     app.delete(
-      "/admin/users/:identifier?",
+      "/admin/users/:identifier",
       verifyToken,
       verifyAdmin,
       async (req, res) => {
