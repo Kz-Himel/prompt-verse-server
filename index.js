@@ -863,6 +863,46 @@ async function run() {
       }
     });
 
+    app.patch(
+      "/admin/prompts/:id/feature",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+          if (!ObjectId.isValid(id))
+            return res
+              .status(400)
+              .json({ success: false, message: "Invalid ID" });
+
+          const prompt = await promptsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!prompt)
+            return res
+              .status(404)
+              .json({ success: false, message: "Prompt not found" });
+
+          const newFeaturedState = !prompt.featured;
+
+          await promptsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { featured: newFeaturedState } },
+          );
+
+          res.json({
+            success: true,
+            featured: newFeaturedState,
+            message: newFeaturedState
+              ? "Prompt featured successfully!"
+              : "Prompt unfeatured successfully!",
+          });
+        } catch (error) {
+          res.status(500).json({ success: false, error: error.message });
+        }
+      },
+    );
+
     app.get("/admin/prompts", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const result = await promptsCollection
