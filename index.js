@@ -250,6 +250,45 @@ async function run() {
       }
     });
 
+    // Chek user premium or not for prompts post
+    app.post("/user/prompts", verifyToken, async (req, res) => {
+      try {
+        const userId = req.user.id;
+        const userRole = req.user.role;
+
+        // 1. check is user premium
+        if (userRole !== "premium") {
+          const promptCount = await promptsCollection.countDocuments({
+            userId: userId,
+          });
+
+          if (promptCount >= 3) {
+            return res.status(403).json({
+              success: false,
+              message:
+                "Limit reached! Free users can only add up to 3 prompts. Please upgrade to premium.",
+            });
+          }
+        }
+
+        // 2.if premium or less than 3
+        const newPrompt = req.body;
+        const result = await promptsCollection.insertOne({
+          ...newPrompt,
+          userId,
+          createdAt: new Date(),
+        });
+
+        res.json({
+          success: true,
+          message: "Prompt created successfully!",
+          result,
+        });
+      } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+      }
+    });
+
     // Current users review that he give others prompt
     app.get("/my-reviews", verifyToken, async (req, res) => {
       try {
