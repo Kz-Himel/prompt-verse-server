@@ -125,100 +125,97 @@ async function run() {
 
     // ─── ২. অল প্রম্পটস মার্কেটপ্লেস API (WITH BLUR/LOCK LOGIC FOR PRIVATE PROMPTS) ───
     app.get("/prompts", async (req, res) => {
-  try {
-    const {
-      search,
-      category,
-      aiTool,
-      difficulty,
-      sortBy,
-      page = 1,
-      limit = 6,
-      email, // ফ্রন্টএন্ড থেকে পাঠানো ইউজারের ইমেইল
-    } = req.query;
+      try {
+        const {
+          search,
+          category,
+          aiTool,
+          difficulty,
+          sortBy,
+          page = 1,
+          limit = 6,
+          email, // ফ্রন্টএন্ড থেকে পাঠানো ইউজারের ইমেইল
+        } = req.query;
 
-    // মার্কেটপ্লেসে শুধুমাত্র approved প্রম্পট দেখাবে
-    let query = { status: "approved" };
+        // মার্কেটপ্লেসে শুধুমাত্র approved প্রম্পট দেখাবে
+        let query = { status: "approved" };
 
-    if (search) {
-      query.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { aiTool: { $regex: search, $options: "i" } },
-        { tags: { $in: [new RegExp(search, "i")] } },
-      ];
-    }
+        if (search) {
+          query.$or = [
+            { title: { $regex: search, $options: "i" } },
+            { aiTool: { $regex: search, $options: "i" } },
+            { tags: { $in: [new RegExp(search, "i")] } },
+          ];
+        }
 
-    if (category) query.category = category;
-    if (aiTool) query.aiTool = aiTool;
-    if (difficulty) query.difficulty = difficulty;
+        if (category) query.category = category;
+        if (aiTool) query.aiTool = aiTool;
+        if (difficulty) query.difficulty = difficulty;
 
-    let sortOptions = { createdAt: -1 };
-    if (sortBy === "mostCopied") sortOptions = { copyCount: -1 };
-    if (sortBy === "mostPopular") sortOptions = { "reviews.rating": -1 };
+        let sortOptions = { createdAt: -1 };
+        if (sortBy === "mostCopied") sortOptions = { copyCount: -1 };
+        if (sortBy === "mostPopular") sortOptions = { "reviews.rating": -1 };
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+        const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const prompts = await promptsCollection
-      .find(query)
-      .sort(sortOptions)
-      .skip(skip)
-      .limit(parseInt(limit))
-      .toArray();
+        const prompts = await promptsCollection
+          .find(query)
+          .sort(sortOptions)
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
 
-    const totalDocuments = await promptsCollection.countDocuments(query);
+        const totalDocuments = await promptsCollection.countDocuments(query);
 
-    // ১. ইউজার প্রিমিয়াম মেম্বার বা এডমিন কিনা তা ডাটাবেজ থেকে চেক করা
-    let isPremiumUser = false;
-    if (email && email !== "undefined" && email !== "") {
-      const user = await usersCollection.findOne({ email });
-      // ক্রিয়েটর যদি ফ্রি প্ল্যানে থাকে, সে অন্যের প্রিমিয়াম কন্টেন্ট দেখতে পাবে না।
-      // তাই শুধুমাত্র user.status === "Premium" অথবা admin গ্লোবাল অ্যাক্সেস পাবে।
-      if (
-        user &&
-        (user.status === "Premium" || user.role === "admin")
-      ) {
-        isPremiumUser = true;
+        // ১. ইউজার প্রিমিয়াম মেম্বার বা এডমিন কিনা তা ডাটাবেজ থেকে চেক করা
+        let isPremiumUser = false;
+        if (email && email !== "undefined" && email !== "") {
+          const user = await usersCollection.findOne({ email });
+          // ক্রিয়েটর যদি ফ্রি প্ল্যানে থাকে, সে অন্যের প্রিমিয়াম কন্টেন্ট দেখতে পাবে না।
+          // তাই শুধুমাত্র user.status === "Premium" অথবা admin গ্লোবাল অ্যাক্সেস পাবে।
+          if (user && (user.status === "Premium" || user.role === "admin")) {
+            isPremiumUser = true;
+          }
+        }
+
+        // ২. প্রসেসড ডেটা জেনারেট করা
+        const processedPrompts = prompts.map((prompt) => {
+          let updatedPrompt = { ...prompt };
+
+          const originalContent = prompt.promptContent || prompt.content || "";
+
+          // চেক করি ইউজার নিজেই এই প্রম্পটের ক্রিয়েটর বা মালিক কিনা
+          const isAuthor = email && prompt.authorEmail === email;
+
+          // প্রম্পট যদি প্রাইভেট (Premium) হয় এবং ইউজার যদি প্রিমিয়াম না হয় প্লাস সে যদি মালিকও না হয়
+          if (prompt.visibility === "private" && !isPremiumUser && !isAuthor) {
+            updatedPrompt.content = "LOCKED_PREMIUM";
+            updatedPrompt.promptContent = "LOCKED_PREMIUM";
+          } else {
+            // প্রিমিয়াম ইউজার, এডমিন অথবা নিজের তৈরি প্রম্পট হলে কন্টেন্ট দেখা যাবে
+            updatedPrompt.content = originalContent;
+            updatedPrompt.promptContent = originalContent;
+          }
+
+          return updatedPrompt;
+        });
+
+        // 🎯 রেসপন্সে processedPrompts এর সাথে 'isPremiumUser' ফ্ল্যাগটি পাঠানো হলো
+        res.json({
+          success: true,
+          data: processedPrompts,
+          isPremiumUser: isPremiumUser,
+          meta: {
+            total: totalDocuments,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalDocuments / limit),
+          },
+        });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
       }
-    }
-
-    // ২. প্রসেসড ডেটা জেনারেট করা
-    const processedPrompts = prompts.map((prompt) => {
-      let updatedPrompt = { ...prompt };
-      
-      const originalContent = prompt.promptContent || prompt.content || "";
-      
-      // চেক করি ইউজার নিজেই এই প্রম্পটের ক্রিয়েটর বা মালিক কিনা
-      const isAuthor = email && prompt.authorEmail === email;
-
-      // প্রম্পট যদি প্রাইভেট (Premium) হয় এবং ইউজার যদি প্রিমিয়াম না হয় প্লাস সে যদি মালিকও না হয়
-      if (prompt.visibility === "private" && !isPremiumUser && !isAuthor) {
-        updatedPrompt.content = "LOCKED_PREMIUM";
-        updatedPrompt.promptContent = "LOCKED_PREMIUM";
-      } else {
-        // প্রিমিয়াম ইউজার, এডমিন অথবা নিজের তৈরি প্রম্পট হলে কন্টেন্ট দেখা যাবে
-        updatedPrompt.content = originalContent;
-        updatedPrompt.promptContent = originalContent;
-      }
-      
-      return updatedPrompt;
     });
-
-    // 🎯 রেসপন্সে processedPrompts এর সাথে 'isPremiumUser' ফ্ল্যাগটি পাঠানো হলো
-    res.json({
-      success: true,
-      data: processedPrompts,
-      isPremiumUser: isPremiumUser, 
-      meta: {
-        total: totalDocuments,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        totalPages: Math.ceil(totalDocuments / limit),
-      },
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
     // User Dashboard stats
     // আপনার ইউজার ড্যাশবোর্ডের ডেটার জন্য ব্যাকএন্ড রাউট
@@ -661,6 +658,139 @@ async function run() {
       }
     });
 
+    // ─── ১৩. টপ ক্রিয়েটরদের ডাইনামিক লিস্ট নিয়ে আসার API ───
+    app.get("/top-creators", async (req, res) => {
+      try {
+        const topCreators = await promptsCollection
+          .aggregate([
+            // ১. শুধুমাত্র approved প্রম্পটগুলো ফিল্টার করা হলো
+            { $match: { status: "approved" } },
+            // ২. ক্রিয়েটরের ইমেইল অনুযায়ী গ্রুপ করে স্ট্যাটস ক্যালকুলেট করা
+            {
+              $group: {
+                _id: "$authorEmail",
+                name: { $first: "$authorName" }, // প্রম্পটে authorName সেভ করা থাকতে হবে
+                role: { $first: "$authorRole" },
+                totalPrompts: { $sum: 1 },
+                totalCopies: { $sum: "$copyCount" },
+                averageRating: {
+                  $avg: { $ifNull: [{ $avg: "$reviews.rating" }, 5] },
+                },
+              },
+            },
+            // ৩. সবচেয়ে বেশি কপি হওয়া ক্রিয়েটরদের প্রথমে রাখা
+            { $sort: { totalCopies: -1 } },
+            // ৪. টপ ৬ জন ক্রিয়েটর নেওয়া
+            { $limit: 6 },
+          ])
+          .toArray();
+
+        // কালার এবং ব্যাজ ডাইনামিক করার জন্য ম্যাপ করা
+        const colors = [
+          "#7C3AED",
+          "#F59E0B",
+          "#94A3B8",
+          "#CD7C2F",
+          "#06B6D4",
+          "#10B981",
+        ];
+        const badges = ["👑", "🥇", "🥈", "🥉", "⭐", "⭐"];
+
+        const formattedCreators = topCreators.map((creator, index) => {
+          const name = creator.name || creator._id.split("@")[0]; // নাম না থাকলে ইমেইল থেকে নেওয়া
+          return {
+            name: name.charAt(0).toUpperCase() + name.slice(1),
+            role:
+              creator.role === "creator"
+                ? "AI Prompt Creator"
+                : "Community User",
+            prompts: creator.totalPrompts,
+            rating: parseFloat(creator.averageRating.toFixed(1)) || 5.0,
+            badge: badges[index] || "⭐",
+            color: colors[index] || "#64748B",
+            initials: name.substring(0, 2).toUpperCase(),
+          };
+        });
+
+        res.json({ success: true, data: formattedCreators });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+    // ─── ১৪. ইউজার রিভিউ নিয়ে আসার API ───
+    // ─── ১৪. ইউজার রিভিউ নিয়ে আসার ডাইনামিক API ───
+    app.get("/customer-reviews", async (req, res) => {
+      try {
+        const reviewsData = await promptsCollection
+          .aggregate([
+            { $unwind: "$reviews" },
+            { $sort: { "reviews.createdAt": -1 } },
+            { $limit: 6 },
+            {
+              $project: {
+                // ডাটাবেজে নাম যেভাবে থাকতে পারে (সবগুলো সম্ভাব্য নাম চেক করা হচ্ছে)
+                name: {
+                  $ifNull: [
+                    "$reviews.reviewerName",
+                    "$reviews.username",
+                    "$reviews.name",
+                    "$reviews.userEmail", // নাম না থাকলে ইমেইল দেখাবে
+                    "Anonymous User",
+                  ],
+                },
+                role: { $ifNull: ["$reviews.reviewerRole", "AI Enthusiast"] },
+                text: { $ifNull: ["$reviews.comment", "$reviews.text"] },
+                rating: "$reviews.rating",
+              },
+            },
+          ])
+          .toArray();
+
+        const colors = [
+          "#7C3AED",
+          "#06B6D4",
+          "#10B981",
+          "#F59E0B",
+          "#EF4444",
+          "#8B5CF6",
+        ];
+
+        const formattedReviews = reviewsData.map((review, index) => {
+          let reviewerName = review.name;
+
+          // যদি ইমেইল চলে আসে, তবে @ এর আগের অংশটুকু নাম হিসেবে নেওয়া হবে
+          if (reviewerName.includes("@")) {
+            reviewerName = reviewerName.split("@")[0];
+          }
+
+          // নামের প্রথম অক্ষর বড় হাতের করা
+          reviewerName =
+            reviewerName.charAt(0).toUpperCase() + reviewerName.slice(1);
+
+          // ইনিশিয়াল জেনারেট করা (যেমন: John Doe -> JD)
+          const words = reviewerName.split(" ");
+          const initials = words
+            .map((w) => w[0])
+            .join("")
+            .substring(0, 2)
+            .toUpperCase();
+
+          return {
+            name: reviewerName,
+            role: review.role,
+            text: review.text || "Great prompt! Highly recommended.",
+            rating: review.rating || 5,
+            initials: initials || "U",
+            color: colors[index % colors.length],
+          };
+        });
+
+        res.json({ success: true, data: formattedReviews });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
     // ─── 🔑 [ADMIN ONLY ENDPOINTS] ───
     const verifyAdmin = async (req, res, next) => {
       try {
@@ -744,6 +874,23 @@ async function run() {
           .sort({ createdAt: -1 })
           .toArray();
         res.json({ success: true, prompts: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // 🎯 সব পেমেন্ট ডেটা অ্যাডমিনের জন্য নিয়ে আসার API
+    app.get("/payments", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const payments = await paymentsCollection
+          .find()
+          .sort({ date: -1 })
+          .toArray();
+
+        res.json({
+          success: true,
+          data: payments,
+        });
       } catch (error) {
         res.status(500).json({ success: false, error: error.message });
       }
