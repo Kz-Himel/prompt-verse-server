@@ -14,7 +14,7 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// CORS 
+// CORS
 app.use(
   cors({
     origin: process.env.CLIENT_URL || true,
@@ -191,7 +191,7 @@ async function run() {
             updatedPrompt.content = "LOCKED_PREMIUM";
             updatedPrompt.promptContent = "LOCKED_PREMIUM";
           } else {
-            // 
+            //
             updatedPrompt.content = originalContent;
             updatedPrompt.promptContent = originalContent;
           }
@@ -716,7 +716,7 @@ async function run() {
         res.status(500).json({ success: false, error: error.message });
       }
     });
-    
+
     // Users review dynamic API
     app.get("/customer-reviews", async (req, res) => {
       try {
@@ -727,7 +727,7 @@ async function run() {
             { $limit: 6 },
             {
               $project: {
-                // 
+                //
                 name: {
                   $ifNull: [
                     "$reviews.reviewerName",
@@ -757,16 +757,13 @@ async function run() {
         const formattedReviews = reviewsData.map((review, index) => {
           let reviewerName = review.name;
 
-          
           if (reviewerName.includes("@")) {
             reviewerName = reviewerName.split("@")[0];
           }
 
-          
           reviewerName =
             reviewerName.charAt(0).toUpperCase() + reviewerName.slice(1);
 
-          
           const words = reviewerName.split(" ");
           const initials = words
             .map((w) => w[0])
@@ -988,12 +985,20 @@ async function run() {
     );
 
     app.delete(
-      "/admin/users/:identifier",
+      "/admin/users/:identifier?", // এখানে একটা '?' দিয়ে রাউটটি অপশনাল করা হয়েছে
       verifyToken,
       verifyAdmin,
       async (req, res) => {
         try {
-          const { identifier } = req.params;
+          // যদি পাথে না পায়, তাহলে কুয়েরি থেকে আইডি/ইমেইল নিবে
+          const identifier = req.params.identifier || req.query.identifier;
+
+          if (!identifier) {
+            return res
+              .status(400)
+              .json({ success: false, message: "Identifier missing" });
+          }
+
           let query = identifier.includes("@")
             ? { email: identifier }
             : { _id: new ObjectId(identifier) };
@@ -1044,7 +1049,7 @@ async function run() {
               .json({ success: false, message: "Report not found" });
           }
 
-          // 2. delete prompt from promptsCollection 
+          // 2. delete prompt from promptsCollection
           await promptsCollection.deleteOne({
             _id: new ObjectId(report.promptId),
           });
