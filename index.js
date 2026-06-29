@@ -984,46 +984,6 @@ async function run() {
       },
     );
 
-    app.delete(
-      "/admin/users/:identifier?", // এখানে একটা '?' দিয়ে রাউটটি অপশনাল করা হয়েছে
-      verifyToken,
-      verifyAdmin,
-      async (req, res) => {
-        try {
-          // যদি পাথে না পায়, তাহলে কুয়েরি থেকে আইডি/ইমেইল নিবে
-          const identifier = req.params.identifier || req.query.identifier;
-
-          if (!identifier) {
-            return res
-              .status(400)
-              .json({ success: false, message: "Identifier missing" });
-          }
-
-          let query = identifier.includes("@")
-            ? { email: identifier }
-            : { _id: new ObjectId(identifier) };
-
-          if (req.user.sub === identifier || req.user.email === identifier) {
-            return res.status(400).json({
-              success: false,
-              message: "You cannot delete your own admin account!",
-            });
-          }
-
-          const result = await usersCollection.deleteOne(query);
-          if (result.deletedCount === 0)
-            return res
-              .status(404)
-              .json({ success: false, message: "User not found" });
-
-          res.json({ success: true, message: "User deleted successfully" });
-        } catch (error) {
-          res.status(500).json({ success: false, error: error.message });
-        }
-      },
-    );
-
-    // For reported prompt page
     // 1. REMOVE PROMPT
     app.delete(
       "/admin/reported-prompts/:reportId/remove-prompt",
@@ -1039,7 +999,6 @@ async function run() {
               .json({ success: false, message: "Invalid Report ID" });
           }
 
-          // 1. First find report
           const report = await reportsCollection.findOne({
             _id: new ObjectId(reportId),
           });
@@ -1049,12 +1008,10 @@ async function run() {
               .json({ success: false, message: "Report not found" });
           }
 
-          // 2. delete prompt from promptsCollection
           await promptsCollection.deleteOne({
             _id: new ObjectId(report.promptId),
           });
 
-          // 3. make the statues resolved
           await reportsCollection.updateOne(
             { _id: new ObjectId(reportId) },
             { $set: { status: "resolved", actionTaken: "removed_prompt" } },
@@ -1093,13 +1050,11 @@ async function run() {
             });
           }
 
-          // 1. Increase warning count
           await usersCollection.updateOne(
             { email: creatorEmail },
             { $inc: { warningsCount: 1 } },
           );
 
-          // 2. Update report status
           await reportsCollection.updateOne(
             { _id: new ObjectId(reportId) },
             { $set: { status: "resolved", actionTaken: "warned_creator" } },
@@ -1130,7 +1085,6 @@ async function run() {
               .json({ success: false, message: "Invalid Report ID" });
           }
 
-          // Dismis user
           await reportsCollection.updateOne(
             { _id: new ObjectId(reportId) },
             { $set: { status: "dismissed" } },
@@ -1140,6 +1094,45 @@ async function run() {
             success: true,
             message: "Report dismissed. Prompt is safe.",
           });
+        } catch (error) {
+          res.status(500).json({ success: false, error: error.message });
+        }
+      },
+    );
+
+    // CRITICAL: Placed at the bottom to avoid hijacking other specific routes due to optional param (:identifier?)
+    app.delete(
+      "/admin/users/:identifier?",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const identifier = req.params.identifier || req.query.identifier;
+
+          if (!identifier) {
+            return res
+              .status(400)
+              .json({ success: false, message: "Identifier missing" });
+          }
+
+          let query = identifier.includes("@")
+            ? { email: identifier }
+            : { _id: new ObjectId(identifier) };
+
+          if (req.user.sub === identifier || req.user.email === identifier) {
+            return res.status(400).json({
+              success: false,
+              message: "You cannot delete your own admin account!",
+            });
+          }
+
+          const result = await usersCollection.deleteOne(query);
+          if (result.deletedCount === 0)
+            return res
+              .status(404)
+              .json({ success: false, message: "User not found" });
+
+          res.json({ success: true, message: "User deleted successfully" });
         } catch (error) {
           res.status(500).json({ success: false, error: error.message });
         }
