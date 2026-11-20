@@ -84,6 +84,7 @@ async function run() {
     const bookmarksCollection = db.collection("bookmarks");
     const reportsCollection = db.collection("reports");
     const paymentsCollection = db.collection("payments");
+    const noticesCollection = db.collection("notices");
 
     // 1. Prompt post API (SECURED) ───
     app.post("/prompts", verifyToken, async (req, res) => {
@@ -1276,6 +1277,101 @@ async function run() {
           },
         });
       } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+      }
+    });
+
+    // ─── 📢 [NOTICES / ANNOUNCEMENTS SYSTEM] ───
+    // 1. Public: Get all active broadcast notices
+    app.get("/notices", async (req, res) => {
+      try {
+        const notices = await noticesCollection
+          .find({ status: { $ne: "archived" } })
+          .sort({ createdAt: -1 })
+          .limit(30)
+          .toArray();
+
+        return res.status(200).json({
+          success: true,
+          data: notices,
+        });
+      } catch (error) {
+        console.error("Fetch notices error:", error);
+        return res.status(500).json({ success: false, message: error.message });
+      }
+    });
+
+    // 2. Admin: Broadcast a new notice to all users
+    app.post("/admin/notices", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const {
+          title,
+          message,
+          type = "info",
+          priority = "normal",
+          target = "all",
+          link = "",
+        } = req.body;
+
+        if (!title || !message) {
+          return res.status(400).json({
+            success: false,
+            message: "Title and message are required fields.",
+          });
+        }
+
+        const newNotice = {
+          title: title.trim(),
+          message: message.trim(),
+          type: ["info", "warning", "success", "alert"].includes(type)
+            ? type
+            : "info",
+          priority: ["normal", "high", "urgent"].includes(priority)
+            ? priority
+            : "normal",
+          target: ["all", "user", "creator"].includes(target)
+            ? target
+            : "all",
+          link: link ? link.trim() : "",
+          author: req.user?.name || "Admin",
+          authorEmail: req.user?.email,
+          createdAt: new Date(),
+          status: "active",
+        };
+
+        const result = await noticesCollection.insertOne(newNotice);
+
+        return res.status(201).json({
+          success: true,
+          message: "Notice broadcasted successfully!",
+          data: { ...newNotice, _id: result.insertedId },
+        });
+      } catch (error) {
+        console.error("Create notice error:", error);
+        return res.status(500).json({ success: false, message: error.message });
+      }
+    });
+
+    // 3. Admin: Delete / Retract a notice
+    app.delete("/admin/notices/:id", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: "Invalid notice ID format." });
+        }
+
+        const result = await noticesCollection.deleteOne({ _id: new ObjectId(id) });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ success: false, message: "Notice not found." });
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: "Notice deleted successfully.",
+        });
+      } catch (error) {
+        console.error("Delete notice error:", error);
         return res.status(500).json({ success: false, message: error.message });
       }
     });
